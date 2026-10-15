@@ -2,6 +2,7 @@ package com.myano.jsqlite.sql;
 
 import com.myano.jsqlite.sql.Ast.ColumnRef;
 import com.myano.jsqlite.sql.Ast.Concat;
+import com.myano.jsqlite.sql.Ast.CountItem;
 import com.myano.jsqlite.sql.Ast.CountStar;
 import com.myano.jsqlite.sql.Ast.Expr;
 import com.myano.jsqlite.sql.Ast.ExpressionItem;
@@ -23,8 +24,9 @@ public final class Labels {
   public static String item(SelectItem item) {
     return switch (item) {
       case Star ignored -> "*";
-      case CountStar ignored -> "COUNT(*)";
-      case MaxItem max -> "MAX(" + max.column() + ")";
+      case CountStar count -> count.alias() != null ? count.alias() : "COUNT(*)";
+      case CountItem count -> count.alias() != null ? count.alias() : "COUNT";
+      case MaxItem max -> max.alias() != null ? max.alias() : "MAX(" + max.column() + ")";
       case ExpressionItem expression ->
           expression.alias() != null ? expression.alias() : expr(expression.expr());
     };

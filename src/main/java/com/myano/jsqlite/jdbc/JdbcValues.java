@@ -41,6 +41,13 @@ final class JdbcValues {
     if (value instanceof Long number) {
       return number;
     }
+    if (value instanceof Double number) {
+      if (Double.isNaN(number) || number != Math.rint(number)
+          || number > Long.MAX_VALUE || number < Long.MIN_VALUE) {
+        throw new SQLException("not an integer: " + number);
+      }
+      return number.longValue();
+    }
     if (value instanceof Integer number) {
       return number.longValue();
     }
@@ -52,6 +59,59 @@ final class JdbcValues {
       }
     }
     throw new SQLException("not an integer: " + value);
+  }
+
+  static double real(Object value) throws SQLException {
+    if (value == null) {
+      return 0d;
+    }
+    if (value instanceof Double number) {
+      return number;
+    }
+    if (value instanceof Long number) {
+      return number.doubleValue();
+    }
+    if (value instanceof String text) {
+      try {
+        return Double.parseDouble(text.trim());
+      } catch (NumberFormatException ex) {
+        throw new SQLException("not a real: " + text);
+      }
+    }
+    throw new SQLException("not a real: " + value);
+  }
+
+  static byte[] bytes(Object value) throws SQLException {
+    if (value == null) {
+      return null;
+    }
+    if (value instanceof byte[] raw) {
+      return raw.clone();
+    }
+    if (value instanceof String text) {
+      return text.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+    throw new SQLException("not a blob: " + value);
+  }
+
+  static java.math.BigDecimal decimal(Object value) throws SQLException {
+    if (value == null) {
+      return null;
+    }
+    if (value instanceof Long number) {
+      return java.math.BigDecimal.valueOf(number);
+    }
+    if (value instanceof Double number) {
+      return java.math.BigDecimal.valueOf(number);
+    }
+    if (value instanceof String text) {
+      try {
+        return new java.math.BigDecimal(text.trim());
+      } catch (NumberFormatException ex) {
+        throw new SQLException("not a decimal: " + text);
+      }
+    }
+    throw new SQLException("not a decimal: " + value);
   }
 
   static boolean bool(Object value) throws SQLException {
@@ -97,6 +157,12 @@ final class JdbcValues {
   static String typeName(Object value) {
     if (value instanceof Long || value instanceof Integer) {
       return "INTEGER";
+    }
+    if (value instanceof Double) {
+      return "REAL";
+    }
+    if (value instanceof byte[]) {
+      return "BLOB";
     }
     if (value instanceof String) {
       return "TEXT";

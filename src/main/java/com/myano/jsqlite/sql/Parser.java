@@ -9,6 +9,7 @@ import com.myano.jsqlite.sql.Ast.ColumnRef;
 import com.myano.jsqlite.sql.Ast.Compare;
 import com.myano.jsqlite.sql.Ast.CompareOp;
 import com.myano.jsqlite.sql.Ast.Concat;
+import com.myano.jsqlite.sql.Ast.CountItem;
 import com.myano.jsqlite.sql.Ast.CountStar;
 import com.myano.jsqlite.sql.Ast.CreateIndex;
 import com.myano.jsqlite.sql.Ast.CreateTable;
@@ -16,6 +17,7 @@ import com.myano.jsqlite.sql.Ast.Delete;
 import com.myano.jsqlite.sql.Ast.Expr;
 import com.myano.jsqlite.sql.Ast.ExpressionItem;
 import com.myano.jsqlite.sql.Ast.IfNullExpr;
+import com.myano.jsqlite.sql.Ast.InSubquery;
 import com.myano.jsqlite.sql.Ast.Insert;
 import com.myano.jsqlite.sql.Ast.IsNull;
 import com.myano.jsqlite.sql.Ast.Join;
@@ -24,6 +26,7 @@ import com.myano.jsqlite.sql.Ast.Literal;
 import com.myano.jsqlite.sql.Ast.LiteralExpr;
 import com.myano.jsqlite.sql.Ast.MaxItem;
 import com.myano.jsqlite.sql.Ast.Now;
+import com.myano.jsqlite.sql.Ast.Not;
 import com.myano.jsqlite.sql.Ast.NullLiteral;
 import com.myano.jsqlite.sql.Ast.NumberLiteral;
 import com.myano.jsqlite.sql.Ast.Or;
@@ -77,11 +80,13 @@ public final class Parser {
       return switch (peek().type()) {
         case CREATE -> parseCreate();
         case ALTER -> parseAlter();
+        case DROP -> parseDrop();
         case INSERT -> parseInsert();
         case SELECT -> parseSelect();
         case UPDATE -> parseUpdate();
         case DELETE -> parseDelete();
         case PRAGMA -> parsePragma();
+        case SHUTDOWN -> parseShutdown();
         default -> throw syntax("expected a statement");
       };
     }
@@ -123,7 +128,7 @@ public final class Parser {
       }
       expect(TokenType.TABLE);
       boolean ifNotExists = matchIfNotExists();
-      String name = expect(TokenType.IDENT).text();
+      String name = parseTableName();
       expect(TokenType.LPAREN);
       List<Column> columns = new ArrayList<>();
       List<TableConstraint> constraints = new ArrayList<>();
@@ -148,7 +153,7 @@ public final class Parser {
       boolean ifNotExists = matchIfNotExists();
       String name = expect(TokenType.IDENT).text();
       expect(TokenType.ON);
-      String table = expect(TokenType.IDENT).text();
+      String table = parseTableName();
       expect(TokenType.LPAREN);
       List<String> columns = parseIdentList();
       expect(TokenType.RPAREN);
@@ -165,9 +170,9 @@ public final class Parser {
     private Statement parseAlter() {
       expect(TokenType.ALTER);
       expect(TokenType.TABLE);
-      String table = expect(TokenType.IDENT).text();
+      String table = parseTableName();
       expect(TokenType.ADD);
-      expect(TokenType.COLUMN);
+      match(TokenType.COLUMN);
       return new AlterTable(table, parseColumn());
     }
 
@@ -211,7 +216,7 @@ public final class Parser {
         List<String> columns = parseIdentList();
         expect(TokenType.RPAREN);
         expect(TokenType.REFERENCES);
-        String refTable = expect(TokenType.IDENT).text();
+        String refTable = parseTableName();
         expect(TokenType.LPAREN);
         List<String> refColumns = parseIdentList();
         expect(TokenType.RPAREN);
@@ -259,7 +264,7 @@ public final class Parser {
     }
 
     private Column parseColumn() {
-      String name = expect(TokenType.IDENT).text();
+      String name = expectName();
       ColumnType type = parseType();
       boolean notNull = false;
       boolean primaryKey = false;
@@ -270,6 +275,12 @@ public final class Parser {
       boolean defaultNow = false;
       boolean constrained = false;
       while (true) {
+        if (peek().type() == TokenType.IDENT && "generated".equalsIgnoreCase(peek().text())) {
+          skipGeneratedIdentity();
+          autoincrement = true;
+          constrained = true;
+          continue;
+        }
         if (match(TokenType.NOT)) {
           expect(TokenType.NULL);
           notNull = true;
@@ -360,8 +371,15 @@ public final class Parser {
 
     private static ColumnType affinity(String typeName) {
       String upper = typeName.toUpperCase(java.util.Locale.ROOT);
+      if (upper.contains("BLOB") || upper.contains("BINARY") || upper.contains("BYTEA")) {
+        return ColumnType.BLOB;
+      }
       if (upper.contains("INT") || upper.equals("BOOLEAN") || upper.equals("BOOL")) {
         return ColumnType.INTEGER;
+      }
+      if (upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB")
+          || upper.contains("NUM") || upper.contains("DEC")) {
+        return ColumnType.REAL;
       }
       return ColumnType.TEXT;
     }
@@ -374,7 +392,7 @@ public final class Parser {
         orIgnore = true;
       }
       expect(TokenType.INTO);
-      String table = expect(TokenType.IDENT).text();
+      String table = parseTableName();
       List<String> columns = null;
       if (match(TokenType.LPAREN)) {
         columns = parseIdentList();
@@ -431,14 +449,27 @@ public final class Parser {
             throw syntax("derived table needs an alias");
           }
         } else {
-          table = expect(TokenType.IDENT).text();
+          table = parseTableName();
           alias = parseOptionalAlias();
+          while (match(TokenType.COMMA)) {
+            String joinTable = parseTableName();
+            String joinAlias = parseOptionalAlias();
+            joins.add(new Join(false, joinTable, joinAlias, null));
+          }
         }
         while (isJoin()) {
           joins.add(parseJoin());
         }
       }
       Bool where = parseOptionalWhere();
+      List<Expr> groupBy = new ArrayList<>();
+      if (match(TokenType.GROUP)) {
+        expect(TokenType.BY);
+        groupBy.add(parseExpr());
+        while (match(TokenType.COMMA)) {
+          groupBy.add(parseExpr());
+        }
+      }
       List<OrderItem> orderBy = new ArrayList<>();
       if (match(TokenType.ORDER)) {
         expect(TokenType.BY);
@@ -449,27 +480,42 @@ public final class Parser {
       }
       Expr limit = null;
       Expr offset = null;
-      if (match(TokenType.LIMIT)) {
+      if (match(TokenType.OFFSET)) {
+        offset = parseLimit();
+        expect(TokenType.LIMIT);
+        limit = parseLimit();
+      } else if (match(TokenType.LIMIT)) {
         limit = parseLimit();
         if (match(TokenType.OFFSET)) {
           offset = parseLimit();
         }
       }
-      return new Select(distinct, items, table, fromSelect, alias, joins, where, orderBy, limit, offset);
+      skipForUpdate();
+      return new Select(
+          distinct, items, table, fromSelect, alias, joins, where, orderBy, limit, offset, groupBy);
     }
 
     private boolean isJoin() {
       TokenType type = peek().type();
-      return type == TokenType.JOIN || type == TokenType.INNER || type == TokenType.LEFT;
+      return type == TokenType.JOIN
+          || type == TokenType.INNER
+          || type == TokenType.LEFT
+          || type == TokenType.CROSS;
     }
 
     private Join parseJoin() {
+      if (match(TokenType.CROSS)) {
+        expect(TokenType.JOIN);
+        String table = parseTableName();
+        String alias = parseOptionalAlias();
+        return new Join(false, table, alias, null);
+      }
       boolean left = match(TokenType.LEFT);
       if (!left) {
         match(TokenType.INNER);
       }
       expect(TokenType.JOIN);
-      String table = expect(TokenType.IDENT).text();
+      String table = parseTableName();
       String alias = parseOptionalAlias();
       expect(TokenType.ON);
       return new Join(left, table, alias, parseCondition());
@@ -477,7 +523,7 @@ public final class Parser {
 
     private String parseOptionalAlias() {
       if (match(TokenType.AS)) {
-        return expect(TokenType.IDENT).text();
+        return expectName();
       }
       if (peek().type() == TokenType.IDENT) {
         return advance().text();
@@ -489,17 +535,30 @@ public final class Parser {
       if (match(TokenType.STAR)) {
         return new Star();
       }
-      if (match(TokenType.COUNT)) {
+      if (peek().type() == TokenType.COUNT && nextIs(TokenType.LPAREN)) {
+        advance();
         expect(TokenType.LPAREN);
-        expect(TokenType.STAR);
+        if (match(TokenType.STAR)) {
+          expect(TokenType.RPAREN);
+          return new CountStar(parseOptionalAlias());
+        }
+        boolean distinct = match(TokenType.DISTINCT);
+        Expr expr = parseExpr();
         expect(TokenType.RPAREN);
-        return new CountStar();
+        return new CountItem(expr, distinct, parseOptionalAlias());
       }
-      if (match(TokenType.MAX)) {
+      if (peek().type() == TokenType.MAX && nextIs(TokenType.LPAREN)) {
+        advance();
         expect(TokenType.LPAREN);
-        String column = expect(TokenType.IDENT).text();
+        String column = expectName();
+        if (match(TokenType.DOT)) {
+          column = expectName();
+          if (match(TokenType.DOT)) {
+            column = expectName();
+          }
+        }
         expect(TokenType.RPAREN);
-        return new MaxItem(column);
+        return new MaxItem(column, parseOptionalAlias());
       }
       return new ExpressionItem(parseExpr(), parseOptionalAlias());
     }
@@ -524,18 +583,20 @@ public final class Parser {
 
     private Statement parseUpdate() {
       expect(TokenType.UPDATE);
-      String table = expect(TokenType.IDENT).text();
+      String table = parseTableName();
       expect(TokenType.SET);
       List<Assign> assignments = new ArrayList<>();
       assignments.add(parseAssign());
       while (match(TokenType.COMMA)) {
         assignments.add(parseAssign());
       }
-      return new Update(table, assignments, parseOptionalWhere());
+      Update update = new Update(table, assignments, parseOptionalWhere());
+      skipForUpdate();
+      return update;
     }
 
     private Assign parseAssign() {
-      String column = expect(TokenType.IDENT).text();
+      String column = expectName();
       expect(TokenType.EQ);
       return new Assign(column, parseExpr());
     }
@@ -543,8 +604,10 @@ public final class Parser {
     private Statement parseDelete() {
       expect(TokenType.DELETE);
       expect(TokenType.FROM);
-      String table = expect(TokenType.IDENT).text();
-      return new Delete(table, parseOptionalWhere());
+      String table = parseTableName();
+      Delete delete = new Delete(table, parseOptionalWhere());
+      skipForUpdate();
+      return delete;
     }
 
     private Bool parseOptionalWhere() {
@@ -571,6 +634,9 @@ public final class Parser {
     }
 
     private Bool parsePredicate() {
+      if (match(TokenType.NOT)) {
+        return new Not(parsePredicate());
+      }
       if (match(TokenType.LPAREN)) {
         Bool nested = parseCondition();
         expect(TokenType.RPAREN);
@@ -583,6 +649,18 @@ public final class Parser {
         return new Pred(new IsNull(left, not));
       }
       if (match(TokenType.NOT)) {
+        if (match(TokenType.LIKE)) {
+          Expr pattern = parseExpr();
+          char escape = 0;
+          if (match(TokenType.ESCAPE)) {
+            String mark = expect(TokenType.STRING).text();
+            if (mark.length() != 1) {
+              throw syntax("ESCAPE needs one character");
+            }
+            escape = mark.charAt(0);
+          }
+          return new Not(new Pred(new Like(left, pattern, escape)));
+        }
         expect(TokenType.IN);
         return parseInList(left, true);
       }
@@ -590,13 +668,27 @@ public final class Parser {
         return parseInList(left, false);
       }
       if (match(TokenType.LIKE)) {
-        return new Pred(new Like(left, parseExpr()));
+        Expr pattern = parseExpr();
+        char escape = 0;
+        if (match(TokenType.ESCAPE)) {
+          String mark = expect(TokenType.STRING).text();
+          if (mark.length() != 1) {
+            throw syntax("ESCAPE needs one character");
+          }
+          escape = mark.charAt(0);
+        }
+        return new Pred(new Like(left, pattern, escape));
       }
       return new Pred(new Compare(left, parseCompareOp(), parseExpr()));
     }
 
     private Bool parseInList(Expr left, boolean not) {
       expect(TokenType.LPAREN);
+      if (peek().type() == TokenType.SELECT) {
+        Select subquery = (Select) parseSelect();
+        expect(TokenType.RPAREN);
+        return new Pred(new InSubquery(left, subquery, not));
+      }
       List<Expr> values = new ArrayList<>();
       values.add(parseExpr());
       while (match(TokenType.COMMA)) {
@@ -647,6 +739,12 @@ public final class Parser {
     }
 
     private Expr parsePrimary() {
+      if (match(TokenType.TRUE)) {
+        return new LiteralExpr(new NumberLiteral(1L));
+      }
+      if (match(TokenType.FALSE)) {
+        return new LiteralExpr(new NumberLiteral(0L));
+      }
       if (match(TokenType.PARAM)) {
         return new Parameter(parameters++);
       }
@@ -674,7 +772,8 @@ public final class Parser {
         expect(TokenType.RPAREN);
         return result;
       }
-      if (match(TokenType.DATETIME)) {
+      if (peek().type() == TokenType.DATETIME && nextIs(TokenType.LPAREN)) {
+        advance();
         expect(TokenType.LPAREN);
         Token now = expect(TokenType.STRING);
         if (!"now".equals(now.text())) {
@@ -683,10 +782,14 @@ public final class Parser {
         expect(TokenType.RPAREN);
         return new Now();
       }
-      if (peek().type() == TokenType.IDENT) {
+      if (isName(peek())) {
         String name = advance().text();
         if (match(TokenType.DOT)) {
-          return new ColumnRef(name, expect(TokenType.IDENT).text());
+          String second = expectName();
+          if (match(TokenType.DOT)) {
+            return new ColumnRef(second, expectName());
+          }
+          return new ColumnRef(name, second);
         }
         return new ColumnRef(null, name);
       }
@@ -695,6 +798,12 @@ public final class Parser {
 
     private Literal parseLiteral() {
       Token token = peek();
+      if (match(TokenType.TRUE)) {
+        return new NumberLiteral(1L);
+      }
+      if (match(TokenType.FALSE)) {
+        return new NumberLiteral(0L);
+      }
       if (match(TokenType.NUMBER)) {
         return new NumberLiteral(token.number());
       }
@@ -707,13 +816,98 @@ public final class Parser {
       throw syntax("expected a literal");
     }
 
+    private Statement parseShutdown() {
+      expect(TokenType.SHUTDOWN);
+      return new Ast.Shutdown();
+    }
+
+    private Statement parseDrop() {
+      expect(TokenType.DROP);
+      expect(TokenType.TABLE);
+      boolean ifExists = false;
+      if (match(TokenType.IF)) {
+        expect(TokenType.EXISTS);
+        ifExists = true;
+      }
+      return new Ast.DropTable(parseTableName(), ifExists);
+    }
+
+    /** 去掉 schema。information_schema 保留前綴，交給執行層回空結果。 */
+    private String parseTableName() {
+      String name = expect(TokenType.IDENT).text();
+      if (!match(TokenType.DOT)) {
+        return name;
+      }
+      String next = expect(TokenType.IDENT).text();
+      if ("information_schema".equalsIgnoreCase(name)) {
+        return "information_schema." + next;
+      }
+      return next;
+    }
+
+    private void skipForUpdate() {
+      if (!match(TokenType.FOR)) {
+        return;
+      }
+      if (peek().type() == TokenType.UPDATE || peek().type() == TokenType.IDENT) {
+        advance();
+      }
+    }
+
+    private void skipGeneratedIdentity() {
+      advance();
+      while (peek().type() != TokenType.COMMA
+          && peek().type() != TokenType.RPAREN
+          && peek().type() != TokenType.NOT
+          && peek().type() != TokenType.PRIMARY
+          && peek().type() != TokenType.UNIQUE
+          && peek().type() != TokenType.EOF) {
+        if (peek().type() == TokenType.LPAREN) {
+          skipParens();
+        } else {
+          advance();
+        }
+      }
+    }
+
+    private void skipParens() {
+      expect(TokenType.LPAREN);
+      int depth = 1;
+      while (depth > 0 && peek().type() != TokenType.EOF) {
+        if (match(TokenType.LPAREN)) {
+          depth++;
+        } else if (match(TokenType.RPAREN)) {
+          depth--;
+        } else {
+          advance();
+        }
+      }
+    }
+
     private List<String> parseIdentList() {
       List<String> names = new ArrayList<>();
-      names.add(expect(TokenType.IDENT).text());
+      names.add(expectName());
       while (match(TokenType.COMMA)) {
-        names.add(expect(TokenType.IDENT).text());
+        names.add(expectName());
       }
       return names;
+    }
+
+    /** 關鍵字當欄位名。限定在名稱位置，子句開頭仍由呼叫端先匹配。 */
+    private boolean isName(Token token) {
+      return token.type() == TokenType.IDENT || Tokenizer.isKeyword(token.type());
+    }
+
+    private String expectName() {
+      if (!isName(peek())) {
+        throw syntax("expected IDENT");
+      }
+      return advance().text();
+    }
+
+    private boolean nextIs(TokenType type) {
+      int next = pos + 1;
+      return next < tokens.size() && tokens.get(next).type() == type;
     }
 
     private boolean match(TokenType type) {

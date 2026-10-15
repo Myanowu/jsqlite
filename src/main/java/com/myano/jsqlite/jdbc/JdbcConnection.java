@@ -107,23 +107,40 @@ public final class JdbcConnection {
   }
 
   private Statement createStatement(Method method, Object[] args) throws SQLException {
-    if (args.length != 0) {
-      throw JdbcProxy.unsupported(method);
+    if (args.length == 0) {
+      return JdbcStatement.create(database);
     }
-    return JdbcStatement.create(database);
+    if (args.length <= 3 && ints(args)) {
+      return JdbcStatement.create(database);
+    }
+    throw JdbcProxy.unsupported(method);
   }
 
   private PreparedStatement prepare(Method method, Object[] args) throws SQLException {
-    if (args.length == 1 && args[0] instanceof String sql) {
-      return JdbcStatement.prepare(database, sql, false);
-    }
-    if (args.length == 2 && args[0] instanceof String sql && args[1] instanceof Integer keys) {
-      if (keys != Statement.RETURN_GENERATED_KEYS && keys != Statement.NO_GENERATED_KEYS) {
-        throw new SQLException("unsupported generated keys mode " + keys);
+    if (args.length >= 1 && args[0] instanceof String sql) {
+      if (args.length == 1) {
+        return JdbcStatement.prepare(database, sql, false);
       }
-      return JdbcStatement.prepare(database, sql, keys == Statement.RETURN_GENERATED_KEYS);
+      if (args.length == 2 && args[1] instanceof Integer keys) {
+        if (keys != Statement.RETURN_GENERATED_KEYS && keys != Statement.NO_GENERATED_KEYS) {
+          throw new SQLException("unsupported generated keys mode " + keys);
+        }
+        return JdbcStatement.prepare(database, sql, keys == Statement.RETURN_GENERATED_KEYS);
+      }
+      if (args.length >= 2 && ints(java.util.Arrays.copyOfRange(args, 1, args.length))) {
+        return JdbcStatement.prepare(database, sql, false);
+      }
     }
     throw JdbcProxy.unsupported(method);
+  }
+
+  private static boolean ints(Object[] args) {
+    for (Object arg : args) {
+      if (!(arg instanceof Integer)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   private Object setAutoCommit(Method method, Object[] args) throws SQLException {

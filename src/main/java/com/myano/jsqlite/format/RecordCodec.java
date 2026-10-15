@@ -44,9 +44,18 @@ public final class RecordCodec {
         types.write(0);
       } else if (value instanceof Long number) {
         writeInteger(types, body, number);
+      } else if (value instanceof Double number) {
+        types.write(7);
+        long bits = Double.doubleToLongBits(number);
+        for (int shift = 56; shift >= 0; shift -= 8) {
+          body.write((int) (bits >>> shift) & 0xff);
+        }
       } else if (value instanceof String text) {
         byte[] raw = text.getBytes(StandardCharsets.UTF_8);
         types.writeBytes(putVarint(raw.length * 2L + 12));
+        body.writeBytes(raw);
+      } else if (value instanceof byte[] raw) {
+        types.writeBytes(putVarint(raw.length * 2L + 13));
         body.writeBytes(raw);
       } else {
         throw new SqlException("unsupported record value");
@@ -118,6 +127,8 @@ public final class RecordCodec {
       value = readInteger(payload, cursor[0], length);
     } else if (serial == 7) {
       value = readReal(payload, cursor[0]);
+    } else if (serial >= 13 && serial % 2 == 1) {
+      value = java.util.Arrays.copyOfRange(payload, cursor[0], cursor[0] + length);
     } else {
       value = new String(payload, cursor[0], length, StandardCharsets.UTF_8);
     }
@@ -143,7 +154,7 @@ public final class RecordCodec {
         && value >= Long.MIN_VALUE && value <= Long.MAX_VALUE) {
       return (long) value;
     }
-    return Double.toString(value);
+    return value;
   }
 
   private static void writeInteger(ByteArrayOutputStream types, ByteArrayOutputStream body, long number) {

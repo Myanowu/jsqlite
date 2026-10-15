@@ -6,8 +6,10 @@ import com.myano.jsqlite.vm.InsertMode;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 public final class Table {
   public enum Place {
@@ -22,6 +24,8 @@ public final class Table {
   private final List<UniqueKey> uniqueKeys = new ArrayList<>();
   private final List<ForeignKeyConstraint> foreignKeys = new ArrayList<>();
   private final List<Object[]> rows = new ArrayList<>();
+  /** Compact primary-key tuple → row index. SeekPk must be O(1), not a table scan. */
+  private final Map<Object, Integer> primaryIndex = new HashMap<>();
   private int[] primaryKey = new int[0];
   private int integerPkIndex = -1;
   private long nextId = 1;
@@ -52,6 +56,7 @@ public final class Table {
         }
       }
       rows.add(checked);
+      indexPrimary(checked, rows.size() - 1);
       noteIdentity(checked);
     }
   }
@@ -72,6 +77,7 @@ public final class Table {
     this.columns.addAll(columns);
     this.primaryKey = resolvePrimaryKey(constraints, sql);
     this.integerPkIndex = singleIntegerPrimaryKey();
+    primaryIndex.clear();
     validate(constraints, sql);
     uniqueKeys.clear();
     foreignKeys.clear();
@@ -167,20 +173,15 @@ public final class Table {
   }
 
   public int seek(Object[] key) {
-    if (primaryKey.length != key.length) {
+    if (primaryKey.length == 0 || primaryKey.length != key.length) {
       return -1;
     }
-    for (Object part : key) {
-      if (part == null) {
-        return -1;
-      }
+    Object mapKey = compactPrimaryKey(key);
+    if (mapKey == null) {
+      return -1;
     }
-    for (int row = 0; row < rows.size(); row++) {
-      if (keysEqual(rows.get(row), key, primaryKey)) {
-        return row;
-      }
-    }
-    return -1;
+    Integer row = primaryIndex.get(mapKey);
+    return row == null ? -1 : row;
   }
 
   public Place place(Object[] raw, InsertMode mode, int[] conflictTarget) {
@@ -212,6 +213,7 @@ public final class Table {
     }
     assignIdentity(row);
     rows.add(row);
+    indexPrimary(row, rows.size() - 1);
     return Place.INSERTED;
   }
 
@@ -235,11 +237,14 @@ public final class Table {
       }
     }
     noteIdentity(checked);
+    unindexPrimary(rows.get(row));
     rows.set(row, checked);
+    indexPrimary(checked, row);
   }
 
   public void remove(int row) {
     rows.remove(row);
+    rebuildPrimaryIndex();
   }
 
   int findRow(Object[] values) {
@@ -322,6 +327,7 @@ public final class Table {
     foreignKeys.clear();
     foreignKeys.addAll(state.foreignKeys);
     pendingConflict = -1;
+    rebuildPrimaryIndex();
   }
 
   private void validate(List<TableConstraint> constraints, String sql) {
@@ -338,10 +344,7 @@ public final class Table {
         throw new SqlException("datetime default needs TEXT: " + column.name() + ": " + SqlText.snippet(sql));
       }
       if (column.hasDefault() && column.defaultValue() != null) {
-        if (column.type() == ColumnType.INTEGER && !(column.defaultValue() instanceof Long)) {
-          throw new SqlException("type mismatch for " + column.name() + ": " + SqlText.snippet(sql));
-        }
-        if (column.type() == ColumnType.TEXT && !(column.defaultValue() instanceof String)) {
+        if (!accepts(column, column.defaultValue())) {
           throw new SqlException("type mismatch for " + column.name() + ": " + SqlText.snippet(sql));
         }
       }
@@ -405,6 +408,15 @@ public final class Table {
     return indexes;
   }
 
+  private static boolean accepts(Column column, Object value) {
+    return switch (column.type()) {
+      case INTEGER -> value instanceof Long;
+      case TEXT -> value instanceof String;
+      case REAL -> value instanceof Long || value instanceof Double;
+      case BLOB -> value instanceof byte[] || value instanceof String;
+    };
+  }
+
   private Object[] checkValues(Object[] values, boolean inserting) {
     if (values == null || values.length != columns.size()) {
       throw new SqlException("value count mismatch for " + name);
@@ -414,10 +426,7 @@ public final class Table {
       Object value = row[i];
       Column column = columns.get(i);
       if (value != null) {
-        if (column.type() == ColumnType.INTEGER && !(value instanceof Long)) {
-          throw new SqlException("type mismatch for " + column.name());
-        }
-        if (column.type() == ColumnType.TEXT && !(value instanceof String)) {
+        if (!accepts(column, value)) {
           throw new SqlException("type mismatch for " + column.name());
         }
       } else if (i == integerPkIndex) {
@@ -486,6 +495,17 @@ public final class Table {
         return -1;
       }
     }
+    if (primaryKey.length > 0 && sameSet(key, primaryKey)) {
+      Object mapKey = primaryKeyOfRow(row);
+      if (mapKey == null) {
+        return -1;
+      }
+      Integer hit = primaryIndex.get(mapKey);
+      if (hit == null || hit == ignore) {
+        return -1;
+      }
+      return hit;
+    }
     for (int i = 0; i < rows.size(); i++) {
       if (i == ignore) {
         continue;
@@ -495,6 +515,61 @@ public final class Table {
       }
     }
     return -1;
+  }
+
+  private void rebuildPrimaryIndex() {
+    primaryIndex.clear();
+    if (primaryKey.length == 0) {
+      return;
+    }
+    for (int i = 0; i < rows.size(); i++) {
+      indexPrimary(rows.get(i), i);
+    }
+  }
+
+  private void indexPrimary(Object[] row, int index) {
+    Object mapKey = primaryKeyOfRow(row);
+    if (mapKey != null) {
+      primaryIndex.put(mapKey, index);
+    }
+  }
+
+  private void unindexPrimary(Object[] row) {
+    Object mapKey = primaryKeyOfRow(row);
+    if (mapKey != null) {
+      primaryIndex.remove(mapKey);
+    }
+  }
+
+  private Object primaryKeyOfRow(Object[] row) {
+    if (primaryKey.length == 0) {
+      return null;
+    }
+    if (primaryKey.length == 1) {
+      return row[primaryKey[0]];
+    }
+    Object[] parts = new Object[primaryKey.length];
+    for (int i = 0; i < primaryKey.length; i++) {
+      Object part = row[primaryKey[i]];
+      if (part == null) {
+        return null;
+      }
+      parts[i] = part;
+    }
+    return List.copyOf(Arrays.asList(parts));
+  }
+
+  /** {@code key} is already in primary-key column order (SeekPk register order). */
+  private Object compactPrimaryKey(Object[] key) {
+    for (Object part : key) {
+      if (part == null) {
+        return null;
+      }
+    }
+    if (key.length == 1) {
+      return key[0];
+    }
+    return List.copyOf(Arrays.asList(key.clone()));
   }
 
   private boolean keysEqual(Object[] existing, Object[] candidate, int[] key) {

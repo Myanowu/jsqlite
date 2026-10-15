@@ -2,5 +2,7 @@ package com.myano.jsqlite.store;
 
 public enum ColumnType {
   INTEGER,
-  TEXT
+  TEXT,
+  REAL,
+  BLOB
 }

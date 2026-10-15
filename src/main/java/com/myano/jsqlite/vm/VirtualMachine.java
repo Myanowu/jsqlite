@@ -9,10 +9,16 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 public final class VirtualMachine {
-  private static final int STEP_LIMIT = 1_000_000;
+  /** Nested CROSS JOIN without indexes can need tens of millions of steps on embed data. */
+  private static final int STEP_LIMIT = 100_000_000;
   private static final int CURSOR_SLOTS = 32;
   private static final DateTimeFormatter UTC_TIME =
       DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneOffset.UTC);
@@ -22,6 +28,7 @@ public final class VirtualMachine {
     Cursor[] cursors = new Cursor[CURSOR_SLOTS];
     List<Row> results = new ArrayList<>();
     List<KeyedRow> buffered = new ArrayList<>();
+    Map<GroupKey, KeyedRow> grouped = new LinkedHashMap<>();
     int pc = 0;
     for (int step = 0; step < STEP_LIMIT; step++) {
       if (pc < 0 || pc >= program.instructionCount()) {
@@ -30,6 +37,7 @@ public final class VirtualMachine {
       Instruction instruction = program.instruction(pc);
       switch (instruction.op()) {
         case Halt -> {
+          flushGroups(program, grouped, buffered, results);
           flush(program, buffered, results);
           return List.copyOf(results);
         }
@@ -68,8 +76,17 @@ public final class VirtualMachine {
           registers[instruction.p1()] = UTC_TIME.format(Instant.now());
           pc++;
         }
-        case Eq, Lt, Gt, Le, Ge, Ne, Like -> {
+        case Eq, Lt, Gt, Le, Ge, Ne -> {
           if (matches(instruction.op(), registers[instruction.p1()], registers[instruction.p3()])) {
+            pc = instruction.p2();
+          } else {
+            pc++;
+          }
+        }
+        case Like -> {
+          int pattern = instruction.p3() & 0xFFFF;
+          char escape = (char) (instruction.p3() >>> 16);
+          if (like(registers[instruction.p1()], registers[pattern], escape)) {
             pc = instruction.p2();
           } else {
             pc++;
@@ -101,17 +118,42 @@ public final class VirtualMachine {
         }
         case SeekPk -> pc = seek(cursors, instruction, registers, pc);
         case AggCount -> {
-          Object current = registers[instruction.p1()];
-          long count = current instanceof Long value ? value : 0L;
-          registers[instruction.p1()] = count + 1;
+          if (instruction.p3() == 0 || registers[instruction.p2()] != null) {
+            Object current = registers[instruction.p1()];
+            long count = current instanceof Long value ? value : 0L;
+            registers[instruction.p1()] = count + 1;
+          }
           pc++;
         }
         case AggMax -> {
           accumulateMax(registers, instruction);
           pc++;
         }
+        case AggCountDistinct -> {
+          Object value = registers[instruction.p2()];
+          if (value != null) {
+            @SuppressWarnings("unchecked")
+            Set<Object> seen = (Set<Object>) registers[instruction.p1()];
+            if (seen == null) {
+              seen = new HashSet<>();
+              registers[instruction.p1()] = seen;
+            }
+            seen.add(distinctKey(value));
+          }
+          pc++;
+        }
+        case AggCard -> {
+          Object current = registers[instruction.p1()];
+          int size = current instanceof Set<?> seen ? seen.size() : 0;
+          registers[instruction.p3()] = (long) size;
+          pc++;
+        }
+        case Group -> {
+          flushGroups(program, grouped, buffered, results);
+          pc++;
+        }
         case ResultRow -> {
-          keep(program, registers, instruction, results, buffered);
+          keep(program, registers, instruction, results, buffered, grouped);
           pc++;
         }
         case Sort -> {
@@ -228,8 +270,26 @@ public final class VirtualMachine {
   }
 
   private void keep(
-      Program program, Object[] registers, Instruction instruction, List<Row> results, List<KeyedRow> buffered) {
+      Program program,
+      Object[] registers,
+      Instruction instruction,
+      List<Row> results,
+      List<KeyedRow> buffered,
+      Map<GroupKey, KeyedRow> grouped) {
     Row row = resultRow(program, instruction, registers);
+    int[] groups = program.groupRegisters();
+    if (groups.length > 0) {
+      Object[] parts = new Object[groups.length];
+      for (int i = 0; i < parts.length; i++) {
+        parts[i] = registers[groups[i]];
+      }
+      Object[] keys = new Object[program.orderKeys().size()];
+      for (int i = 0; i < keys.length; i++) {
+        keys[i] = registers[program.orderKeys().get(i).register()];
+      }
+      grouped.putIfAbsent(new GroupKey(parts), new KeyedRow(row, keys));
+      return;
+    }
     if (program.orderKeys().isEmpty()) {
       results.add(row);
       return;
@@ -239,6 +299,24 @@ public final class VirtualMachine {
       keys[i] = registers[program.orderKeys().get(i).register()];
     }
     buffered.add(new KeyedRow(row, keys));
+  }
+
+  private void flushGroups(
+      Program program,
+      Map<GroupKey, KeyedRow> grouped,
+      List<KeyedRow> buffered,
+      List<Row> results) {
+    if (grouped.isEmpty()) {
+      return;
+    }
+    if (program.orderKeys().isEmpty()) {
+      for (KeyedRow row : grouped.values()) {
+        results.add(row.row);
+      }
+    } else {
+      buffered.addAll(grouped.values());
+    }
+    grouped.clear();
   }
 
   private void flush(Program program, List<KeyedRow> buffered, List<Row> results) {
@@ -323,10 +401,11 @@ public final class VirtualMachine {
   }
 
   private Object cell(Object value) {
-    if (value == null || value instanceof Long || value instanceof String) {
+    if (value == null || value instanceof Long || value instanceof String
+        || value instanceof Double || value instanceof byte[]) {
       return value;
     }
-    throw new SqlException("result value must be an integer, text, or null");
+    throw new SqlException("result value must be an integer, real, text, blob, or null");
   }
 
   private Object binding(Object[] bindings, int index) {
@@ -350,13 +429,13 @@ public final class VirtualMachine {
     if (value instanceof Long number) {
       return Long.toString(number);
     }
+    if (value instanceof Double number) {
+      return Double.toString(number);
+    }
     throw new SqlException("|| needs integer or text");
   }
 
   private boolean matches(Opcode op, Object left, Object right) {
-    if (op == Opcode.Like) {
-      return like(left, right);
-    }
     return compare(op, left, right);
   }
 
@@ -365,7 +444,7 @@ public final class VirtualMachine {
       return false;
     }
     int cmp = compareValues(left, right);
-    if (!(left instanceof Long && right instanceof Long) && !(left instanceof String && right instanceof String)) {
+    if (!comparable(left, right)) {
       return false;
     }
     return switch (op) {
@@ -389,31 +468,66 @@ public final class VirtualMachine {
     if (right == null) {
       return 1;
     }
-    if (left instanceof Long leftNumber && right instanceof Long rightNumber) {
-      return Long.compare(leftNumber, rightNumber);
+    if (number(left) != null && number(right) != null) {
+      return Double.compare(number(left), number(right));
     }
     if (left instanceof String leftText && right instanceof String rightText) {
       return leftText.compareTo(rightText);
     }
-    if (left instanceof Long) {
+    if (left instanceof byte[] leftBytes && right instanceof byte[] rightBytes) {
+      return java.util.Arrays.compareUnsigned(leftBytes, rightBytes);
+    }
+    if (left instanceof Long || left instanceof Double) {
       return -1;
     }
-    if (right instanceof Long) {
+    if (right instanceof Long || right instanceof Double) {
       return 1;
     }
     return 0;
   }
 
-  private boolean like(Object left, Object right) {
+  private static boolean comparable(Object left, Object right) {
+    if (number(left) != null && number(right) != null) {
+      return true;
+    }
+    if (left instanceof String && right instanceof String) {
+      return true;
+    }
+    return left instanceof byte[] && right instanceof byte[];
+  }
+
+  private static Double number(Object value) {
+    if (value instanceof Long number) {
+      return number.doubleValue();
+    }
+    if (value instanceof Double number) {
+      return number;
+    }
+    return null;
+  }
+
+  private boolean like(Object left, Object right, char escape) {
     if (!(left instanceof String text) || !(right instanceof String pattern)) {
       return false;
     }
-    return likeAt(text, pattern, 0, 0);
+    return likeAt(text, pattern, 0, 0, escape);
   }
 
-  private boolean likeAt(String text, String pattern, int textIndex, int patternIndex) {
+  private boolean likeAt(String text, String pattern, int textIndex, int patternIndex, char escape) {
     while (patternIndex < pattern.length()) {
       char mark = pattern.charAt(patternIndex);
+      if (escape != 0 && mark == escape) {
+        if (patternIndex + 1 >= pattern.length()) {
+          throw new SqlException("LIKE pattern ends with the escape character");
+        }
+        mark = pattern.charAt(++patternIndex);
+        if (textIndex >= text.length() || fold(mark) != fold(text.charAt(textIndex))) {
+          return false;
+        }
+        textIndex++;
+        patternIndex++;
+        continue;
+      }
       if (mark == '%') {
         while (patternIndex < pattern.length() && pattern.charAt(patternIndex) == '%') {
           patternIndex++;
@@ -422,7 +536,7 @@ public final class VirtualMachine {
           return true;
         }
         for (int i = textIndex; i <= text.length(); i++) {
-          if (likeAt(text, pattern, i, patternIndex)) {
+          if (likeAt(text, pattern, i, patternIndex, escape)) {
             return true;
           }
         }
@@ -495,4 +609,47 @@ public final class VirtualMachine {
   }
 
   private record KeyedRow(Row row, Object[] keys) {}
+
+  private static final class GroupKey {
+    private final Object[] parts;
+
+    private GroupKey(Object[] parts) {
+      this.parts = parts;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      return other instanceof GroupKey key && Arrays.deepEquals(parts, key.parts);
+    }
+
+    @Override
+    public int hashCode() {
+      return Arrays.deepHashCode(parts);
+    }
+  }
+
+  private static Object distinctKey(Object value) {
+    if (value instanceof byte[] bytes) {
+      return new BytesKey(bytes);
+    }
+    return value;
+  }
+
+  private static final class BytesKey {
+    private final byte[] bytes;
+
+    private BytesKey(byte[] bytes) {
+      this.bytes = bytes;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      return other instanceof BytesKey key && Arrays.equals(bytes, key.bytes);
+    }
+
+    @Override
+    public int hashCode() {
+      return Arrays.hashCode(bytes);
+    }
+  }
 }

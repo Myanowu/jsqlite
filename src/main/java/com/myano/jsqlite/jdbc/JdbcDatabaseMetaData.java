@@ -4,6 +4,7 @@ import com.myano.jsqlite.Database;
 import com.myano.jsqlite.Row;
 import com.myano.jsqlite.store.Column;
 import com.myano.jsqlite.store.ColumnType;
+import com.myano.jsqlite.store.IndexDef;
 import com.myano.jsqlite.store.TableInfo;
 
 import java.lang.reflect.Method;
@@ -59,7 +60,16 @@ final class JdbcDatabaseMetaData {
       case "getTables" -> tables(method, args);
       case "getColumns" -> columns(method, args);
       case "getPrimaryKeys" -> primaryKeys(method, args);
-      default -> throw JdbcProxy.unsupported(method);
+      case "getIndexInfo" -> indexInfo(method, args);
+      case "getImportedKeys", "getExportedKeys", "getCrossReference" -> emptyKeys();
+      case "getDatabaseProductName" -> "SQLite";
+      case "getDatabaseProductVersion" -> "3";
+      case "getDriverName" -> "JSQLite";
+      case "getDriverVersion" -> "0.1";
+      case "getIdentifierQuoteString" -> "\"";
+      case "getExtraNameCharacters" -> "";
+      case "getSQLKeywords" -> "";
+      default -> metadataDefault(method);
     };
   }
 
@@ -99,16 +109,16 @@ final class JdbcDatabaseMetaData {
           continue;
         }
         boolean required = column.notNull() || keySeq(table, i) > 0;
-        boolean text = column.type() == ColumnType.TEXT;
+        int jdbcType = jdbcType(column.type());
         rows.add(row(
             COLUMN_COLUMNS,
             null,
             null,
             table.name(),
             column.name(),
-            (long) (text ? Types.VARCHAR : Types.INTEGER),
-            text ? "TEXT" : "INTEGER",
-            text ? 0L : 19L,
+            (long) jdbcType,
+            column.type().name(),
+            column.type() == ColumnType.TEXT || column.type() == ColumnType.BLOB ? 0L : 19L,
             0L,
             (long) (required ? DatabaseMetaData.columnNoNulls : DatabaseMetaData.columnNullable),
             null,
@@ -119,6 +129,111 @@ final class JdbcDatabaseMetaData {
       }
     }
     return JdbcResultSet.create(database, COLUMN_COLUMNS, rows);
+  }
+
+  private ResultSet indexInfo(Method method, Object[] args) throws SQLException {
+    if (args.length != 5) {
+      throw JdbcProxy.unsupported(method);
+    }
+    String tableName = args[2] instanceof String text ? text : null;
+    boolean uniqueOnly = args[3] instanceof Boolean flag && flag;
+    List<String> columns = List.of(
+        "TABLE_CAT",
+        "TABLE_SCHEM",
+        "TABLE_NAME",
+        "NON_UNIQUE",
+        "INDEX_QUALIFIER",
+        "INDEX_NAME",
+        "TYPE",
+        "ORDINAL_POSITION",
+        "COLUMN_NAME",
+        "ASC_OR_DESC",
+        "CARDINALITY",
+        "PAGES",
+        "FILTER_CONDITION");
+    List<Row> rows = new ArrayList<>();
+    for (IndexDef index : database.indexes()) {
+      if (tableName != null && !index.table().equalsIgnoreCase(tableName)) {
+        continue;
+      }
+      if (uniqueOnly && !index.unique()) {
+        continue;
+      }
+      List<String> names = index.columns();
+      for (int i = 0; i < names.size(); i++) {
+        rows.add(row(
+            columns,
+            null,
+            null,
+            index.table(),
+            index.unique() ? 0L : 1L,
+            null,
+            index.name(),
+            (long) DatabaseMetaData.tableIndexOther,
+            (long) (i + 1),
+            names.get(i),
+            "A",
+            null,
+            null,
+            null));
+      }
+    }
+    return JdbcResultSet.create(database, columns, rows);
+  }
+
+  private ResultSet emptyKeys() {
+    return JdbcResultSet.create(database, List.of(
+        "PKTABLE_CAT",
+        "PKTABLE_SCHEM",
+        "PKTABLE_NAME",
+        "PKCOLUMN_NAME",
+        "FKTABLE_CAT",
+        "FKTABLE_SCHEM",
+        "FKTABLE_NAME",
+        "FKCOLUMN_NAME",
+        "KEY_SEQ",
+        "UPDATE_RULE",
+        "DELETE_RULE",
+        "FK_NAME",
+        "PK_NAME",
+        "DEFERRABILITY"), List.of());
+  }
+
+  private Object metadataDefault(Method method) throws SQLException {
+    Class<?> type = method.getReturnType();
+    if (type == boolean.class) {
+      return switch (method.getName()) {
+        case "supportsTransactions", "supportsGetGeneratedKeys", "supportsBatchUpdates",
+            "supportsMixedCaseIdentifiers", "supportsMixedCaseQuotedIdentifiers",
+            "storesMixedCaseIdentifiers", "storesMixedCaseQuotedIdentifiers",
+            "nullsAreSortedHigh", "nullsAreSortedAtStart" -> true;
+        default -> false;
+      };
+    }
+    if (type == int.class) {
+      return switch (method.getName()) {
+        case "getDatabaseMajorVersion" -> 3;
+        case "getDriverMinorVersion" -> 1;
+        case "getDefaultTransactionIsolation" -> java.sql.Connection.TRANSACTION_SERIALIZABLE;
+        default -> 0;
+      };
+    }
+    if (type == String.class) {
+      return "";
+    }
+    if (ResultSet.class.isAssignableFrom(type)) {
+      return JdbcResultSet.create(database, List.of(), List.of());
+    }
+    throw JdbcProxy.unsupported(method);
+  }
+
+  private static int jdbcType(ColumnType type) {
+    return switch (type) {
+      case INTEGER -> Types.INTEGER;
+      case TEXT -> Types.VARCHAR;
+      case REAL -> Types.DOUBLE;
+      case BLOB -> Types.BLOB;
+    };
   }
 
   private ResultSet primaryKeys(Method method, Object[] args) throws SQLException {

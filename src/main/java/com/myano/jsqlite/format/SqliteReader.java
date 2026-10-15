@@ -182,11 +182,37 @@ public final class SqliteReader {
       }
       throw new SqlException("type mismatch for " + table + "." + column.name());
     }
+    if (column.type() == ColumnType.REAL) {
+      if (value instanceof Long || value instanceof Double) {
+        return value;
+      }
+      if (value instanceof String text) {
+        try {
+          return Double.parseDouble(text);
+        } catch (NumberFormatException ex) {
+          throw new SqlException("type mismatch for " + table + "." + column.name());
+        }
+      }
+    }
+    if (column.type() == ColumnType.BLOB) {
+      if (value instanceof byte[] raw) {
+        return raw;
+      }
+      if (value instanceof String text) {
+        return text.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      }
+    }
     if (value instanceof String text) {
       return text;
     }
     if (value instanceof Long number) {
       return Long.toString(number);
+    }
+    if (value instanceof Double number) {
+      return Double.toString(number);
+    }
+    if (value instanceof byte[] raw) {
+      return new String(raw, java.nio.charset.StandardCharsets.UTF_8);
     }
     throw new SqlException("type mismatch for " + table + "." + column.name());
   }
@@ -261,7 +287,13 @@ public final class SqliteReader {
 
   private static String text(List<Object> values, int index) {
     Object value = index < values.size() ? values.get(index) : null;
-    return value == null ? null : value.toString();
+    if (value == null) {
+      return null;
+    }
+    if (value instanceof byte[] raw) {
+      return new String(raw, java.nio.charset.StandardCharsets.UTF_8);
+    }
+    return value.toString();
   }
 
   private static int integer(List<Object> values, int index) {

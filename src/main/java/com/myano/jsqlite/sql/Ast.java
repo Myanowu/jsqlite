@@ -9,7 +9,11 @@ public final class Ast {
   private Ast() {}
 
   public sealed interface Statement
-      permits CreateTable, CreateIndex, AlterTable, Insert, Select, Update, Delete, Pragma {}
+      permits CreateTable, CreateIndex, AlterTable, DropTable, Insert, Select, Update, Delete, Pragma, Shutdown {}
+
+  public record DropTable(String name, boolean ifExists) implements Statement {}
+
+  public record Shutdown() implements Statement {}
 
   /** argument 是 table_info 的表名。value 是賦值形式的右方。兩者都空則是查詢。 */
   public record Pragma(String name, String argument, String value) implements Statement {}
@@ -68,12 +72,14 @@ public final class Ast {
       Bool where,
       List<OrderItem> orderBy,
       Expr limit,
-      Expr offset)
+      Expr offset,
+      List<Expr> groupBy)
       implements Statement {
     public Select {
       items = List.copyOf(items);
       joins = List.copyOf(joins);
       orderBy = List.copyOf(orderBy);
+      groupBy = List.copyOf(groupBy);
     }
   }
 
@@ -87,7 +93,7 @@ public final class Ast {
 
   public record Assign(String column, Expr value) {}
 
-  public sealed interface SelectItem permits Star, ExpressionItem, CountStar, MaxItem {}
+  public sealed interface SelectItem permits Star, ExpressionItem, CountStar, CountItem, MaxItem {}
 
   public record Star() implements SelectItem {}
 
@@ -97,9 +103,20 @@ public final class Ast {
     }
   }
 
-  public record CountStar() implements SelectItem {}
+  public record CountStar(String alias) implements SelectItem {
+    public CountStar() {
+      this(null);
+    }
+  }
 
-  public record MaxItem(String column) implements SelectItem {}
+  /** {@code COUNT(expr)} / {@code COUNT(DISTINCT expr)}。 */
+  public record CountItem(Expr expr, boolean distinct, String alias) implements SelectItem {}
+
+  public record MaxItem(String column, String alias) implements SelectItem {
+    public MaxItem(String column) {
+      this(column, null);
+    }
+  }
 
   public sealed interface Expr permits LiteralExpr, ColumnRef, Concat, IfNullExpr, Now, Parameter {}
 
@@ -115,21 +132,26 @@ public final class Ast {
 
   public record Parameter(int index) implements Expr {}
 
-  public sealed interface Bool permits And, Or, Pred {}
+  public sealed interface Bool permits And, Or, Not, Pred {}
 
   public record And(Bool left, Bool right) implements Bool {}
 
   public record Or(Bool left, Bool right) implements Bool {}
 
+  public record Not(Bool condition) implements Bool {}
+
   public record Pred(Predicate predicate) implements Bool {}
 
-  public sealed interface Predicate permits Compare, IsNull, Like {}
+  public sealed interface Predicate permits Compare, IsNull, Like, InSubquery {}
 
   public record Compare(Expr left, CompareOp op, Expr right) implements Predicate {}
 
   public record IsNull(Expr expr, boolean not) implements Predicate {}
 
-  public record Like(Expr left, Expr right) implements Predicate {}
+  public record Like(Expr left, Expr right, char escape) implements Predicate {}
+
+  /** {@code left [NOT] IN (SELECT ...)} — single-column subquery membership. */
+  public record InSubquery(Expr left, Select query, boolean not) implements Predicate {}
 
   public enum CompareOp {
     EQ,

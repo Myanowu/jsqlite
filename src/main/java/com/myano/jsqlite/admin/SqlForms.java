@@ -16,9 +16,9 @@ final class SqlForms {
       "CREATE", "TABLE", "INTEGER", "TEXT", "INSERT", "INTO", "VALUES",
       "SELECT", "DISTINCT", "FROM", "AS", "WHERE", "UPDATE", "SET", "DELETE", "AND", "OR", "NULL",
       "IF", "NOT", "EXISTS", "PRIMARY", "KEY", "AUTOINCREMENT", "UNIQUE", "DEFAULT",
-      "INDEX", "ON", "JOIN", "INNER", "LEFT", "ORDER", "BY", "LIMIT", "OFFSET",
+      "INDEX", "ON", "JOIN", "INNER", "LEFT", "CROSS", "ORDER", "BY", "LIMIT", "OFFSET",
       "ASC", "DESC", "ALTER", "ADD", "COLUMN", "CONFLICT", "DO", "IGNORE", "IS",
-      "LIKE", "IFNULL", "DATETIME", "COUNT", "MAX", "REFERENCES", "FOREIGN", "CONSTRAINT");
+      "LIKE", "ESCAPE", "IFNULL", "DATETIME", "COUNT", "MAX", "REFERENCES", "FOREIGN", "CONSTRAINT");
 
   private SqlForms() {}
 

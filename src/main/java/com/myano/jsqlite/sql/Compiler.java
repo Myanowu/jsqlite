@@ -8,11 +8,13 @@ import com.myano.jsqlite.sql.Ast.ColumnRef;
 import com.myano.jsqlite.sql.Ast.Compare;
 import com.myano.jsqlite.sql.Ast.CompareOp;
 import com.myano.jsqlite.sql.Ast.Concat;
+import com.myano.jsqlite.sql.Ast.CountItem;
 import com.myano.jsqlite.sql.Ast.CountStar;
 import com.myano.jsqlite.sql.Ast.Delete;
 import com.myano.jsqlite.sql.Ast.Expr;
 import com.myano.jsqlite.sql.Ast.ExpressionItem;
 import com.myano.jsqlite.sql.Ast.IfNullExpr;
+import com.myano.jsqlite.sql.Ast.InSubquery;
 import com.myano.jsqlite.sql.Ast.Insert;
 import com.myano.jsqlite.sql.Ast.IsNull;
 import com.myano.jsqlite.sql.Ast.Join;
@@ -20,6 +22,7 @@ import com.myano.jsqlite.sql.Ast.Like;
 import com.myano.jsqlite.sql.Ast.Literal;
 import com.myano.jsqlite.sql.Ast.LiteralExpr;
 import com.myano.jsqlite.sql.Ast.MaxItem;
+import com.myano.jsqlite.sql.Ast.Not;
 import com.myano.jsqlite.sql.Ast.Now;
 import com.myano.jsqlite.sql.Ast.NullLiteral;
 import com.myano.jsqlite.sql.Ast.NumberLiteral;
@@ -51,20 +54,34 @@ import java.util.Locale;
 public final class Compiler {
   private static final int CURSOR = 0;
 
+  /** Set for the duration of {@link #compile}; used by nested IN-subquery emission. */
+  private MemoryCatalog activeCatalog;
+
   public Program compile(Statement statement, MemoryCatalog catalog, String sql) {
-    return switch (statement) {
-      case Ast.CreateTable ignored ->
-          throw new IllegalStateException("CREATE TABLE does not compile to bytecode");
-      case Ast.CreateIndex ignored ->
-          throw new IllegalStateException("CREATE INDEX does not compile to bytecode");
-      case Ast.AlterTable ignored ->
-          throw new IllegalStateException("ALTER TABLE does not compile to bytecode");
-      case Insert insert -> compileInsert(insert, catalog, sql);
-      case Select select -> compileSelect(select, catalog, sql);
-      case Update update -> compileUpdate(update, catalog, sql);
-      case Delete delete -> compileDelete(delete, catalog, sql);
-      case Ast.Pragma ignored -> throw new IllegalStateException("PRAGMA does not compile to bytecode");
-    };
+    MemoryCatalog previous = activeCatalog;
+    activeCatalog = catalog;
+    try {
+      return switch (statement) {
+        case Ast.CreateTable ignored ->
+            throw new IllegalStateException("CREATE TABLE does not compile to bytecode");
+        case Ast.CreateIndex ignored ->
+            throw new IllegalStateException("CREATE INDEX does not compile to bytecode");
+        case Ast.AlterTable ignored ->
+            throw new IllegalStateException("ALTER TABLE does not compile to bytecode");
+        case Ast.DropTable ignored ->
+            throw new IllegalStateException("DROP TABLE does not compile to bytecode");
+        case Ast.Shutdown ignored ->
+            throw new IllegalStateException("SHUTDOWN does not compile to bytecode");
+        case Insert insert -> compileInsert(insert, catalog, sql);
+        case Select select -> compileSelect(select, catalog, sql);
+        case Update update -> compileUpdate(update, catalog, sql);
+        case Delete delete -> compileDelete(delete, catalog, sql);
+        case Ast.Pragma ignored ->
+            throw new IllegalStateException("PRAGMA does not compile to bytecode");
+      };
+    } finally {
+      activeCatalog = previous;
+    }
   }
 
   private Program compileInsert(Insert insert, MemoryCatalog catalog, String sql) {
@@ -119,7 +136,13 @@ public final class Compiler {
     if (select.fromSelect() != null) {
       throw new SqlException("derived table was not materialized: " + SqlText.snippet(sql));
     }
+    if (!select.groupBy().isEmpty() && isAggregate(select)) {
+      throw new SqlException("GROUP BY with aggregates is not supported: " + SqlText.snippet(sql));
+    }
     if (select.table() == null) {
+      if (!select.groupBy().isEmpty()) {
+        throw new SqlException("GROUP BY needs a table: " + SqlText.snippet(sql));
+      }
       return compileScalar(select, sql);
     }
     if (!select.joins().isEmpty()) {
@@ -155,6 +178,7 @@ public final class Compiler {
       switch (item) {
         case Star ignored -> throw new SqlException("SELECT * needs a table: " + SqlText.snippet(sql));
         case CountStar ignored -> asm.emit(Opcode.Integer, start + i, 0, 0);
+        case CountItem ignored -> asm.emit(Opcode.Integer, start + i, 0, 0);
         case MaxItem ignored -> asm.emit(Opcode.Null, start + i, 0, 0);
         case ExpressionItem expression -> {
           if (containsColumn(expression.expr())) {
@@ -179,6 +203,7 @@ public final class Compiler {
     Assembler asm = new Assembler();
     prepareLimit(asm, select, sql);
     List<Integer> orderRegs = prepareOrderRegisters(asm, select);
+    prepareGroupRegisters(asm, select);
     Env env = envFor(table, select.alias(), sql);
     Expr[] keys = seekKeys(table, select.where(), env);
     if (keys != null) {
@@ -189,6 +214,7 @@ public final class Compiler {
     int width = width(select, env.sources, sql);
     int start = asm.allocRange(width);
     writeProjection(asm, select, env, start, sql);
+    writeGroupInto(asm, select, env);
     writeOrderInto(asm, select, env, orderRegs);
     asm.emit(Opcode.ResultRow, start, width, 0);
     finishScan(asm, scan);
@@ -206,6 +232,7 @@ public final class Compiler {
     int width = width(select, env.sources, env.sql);
     int start = asm.allocRange(width);
     writeProjection(asm, select, env, start, env.sql);
+    writeGroupInto(asm, select, env);
     writeOrderInto(asm, select, env, orderRegs);
     asm.emit(Opcode.ResultRow, start, width, 0);
     emitEpilogue(asm);
@@ -237,6 +264,7 @@ public final class Compiler {
           acc[i] = asm.alloc();
           asm.emit(Opcode.Integer, acc[i], 0, 0);
         }
+        case CountItem count -> initCount(asm, acc, i, count.distinct());
         case MaxItem ignored -> {
           acc[i] = asm.alloc();
           asm.emit(Opcode.Null, acc[i], 0, 0);
@@ -261,6 +289,7 @@ public final class Compiler {
     for (int i = 0; i < select.items().size(); i++) {
       switch (select.items().get(i)) {
         case CountStar ignored -> asm.emit(Opcode.AggCount, acc[i], 0, 0);
+        case CountItem count -> emitCount(asm, acc[i], count, env);
         case MaxItem max -> {
           int value = emitExpr(asm, new ColumnRef(null, max.column()), env);
           asm.emit(Opcode.AggMax, acc[i], value, 0);
@@ -278,9 +307,8 @@ public final class Compiler {
     int start = asm.allocRange(select.items().size());
     for (int i = 0; i < select.items().size(); i++) {
       SelectItem item = select.items().get(i);
-      if (acc[i] >= 0) {
-        asm.emit(Opcode.IfNullValue, acc[i], acc[i], start + i);
-      } else if (item instanceof ExpressionItem expression) {
+      storeAggregate(asm, item, acc[i], start + i);
+      if (acc[i] < 0 && item instanceof ExpressionItem expression) {
         emitExprInto(asm, start + i, expression.expr(), env);
       }
     }
@@ -308,6 +336,7 @@ public final class Compiler {
     Assembler asm = new Assembler();
     prepareLimit(asm, select, sql);
     List<Integer> orderRegs = prepareOrderRegisters(asm, select);
+    prepareGroupRegisters(asm, select);
     int zero = -1;
     for (Join join : select.joins()) {
       if (join.left()) {
@@ -350,6 +379,7 @@ public final class Compiler {
           acc[i] = asm.alloc();
           asm.emit(Opcode.Integer, acc[i], 0, 0);
         }
+        case CountItem count -> initCount(asm, acc, i, count.distinct());
         case MaxItem ignored -> {
           acc[i] = asm.alloc();
           asm.emit(Opcode.Null, acc[i], 0, 0);
@@ -371,9 +401,8 @@ public final class Compiler {
     int start = asm.allocRange(select.items().size());
     for (int i = 0; i < select.items().size(); i++) {
       SelectItem item = select.items().get(i);
-      if (acc[i] >= 0) {
-        asm.emit(Opcode.IfNullValue, acc[i], acc[i], start + i);
-      } else if (item instanceof ExpressionItem expression) {
+      storeAggregate(asm, item, acc[i], start + i);
+      if (acc[i] < 0 && item instanceof ExpressionItem expression) {
         emitExprInto(asm, start + i, expression.expr(), env);
       }
     }
@@ -402,26 +431,49 @@ public final class Compiler {
     if (level == 0) {
       int rewind = asm.emit(Opcode.Rewind, source.cursor(), -1, 0);
       int loop = asm.here();
+      List<Integer> filterFails = new ArrayList<>();
+      emitReadyFilters(asm, select.where(), env, 0, filterFails);
       emitAggregateLevel(asm, select, env, 1, zero, acc);
-      asm.emit(Opcode.Next, source.cursor(), loop, 0);
+      int next = asm.emit(Opcode.Next, source.cursor(), loop, 0);
+      for (int jump : filterFails) {
+        asm.patch(jump, next);
+      }
       int after = asm.here();
       asm.patch(rewind, after);
       return;
     }
     Join join = select.joins().get(level - 1);
     if (!join.left()) {
+      if (emitInnerJoinSeek(asm, select, env, level, zero, null, acc, source, join)) {
+        return;
+      }
       int rewind = asm.emit(Opcode.Rewind, source.cursor(), -1, 0);
       int loop = asm.here();
+      List<Integer> filterFails = new ArrayList<>();
+      if (join.on() == null) {
+        emitReadyFilters(asm, select.where(), env, level, filterFails);
+        emitAggregateLevel(asm, select, env, level + 1, zero, acc);
+        int next = asm.emit(Opcode.Next, source.cursor(), loop, 0);
+        for (int jump : filterFails) {
+          asm.patch(jump, next);
+        }
+        asm.patch(rewind, asm.here());
+        return;
+      }
       List<Integer> trues = new ArrayList<>();
       List<Integer> fails = new ArrayList<>();
-      emitBool(asm, join.on(), env, trues, fails);
+      emitJoinCondition(asm, join.on(), env, trues, fails);
       int matched = asm.here();
       for (int jump : trues) {
         asm.patch(jump, matched);
       }
+      emitReadyFilters(asm, select.where(), env, level, filterFails);
       emitAggregateLevel(asm, select, env, level + 1, zero, acc);
       int next = asm.emit(Opcode.Next, source.cursor(), loop, 0);
       for (int jump : fails) {
+        asm.patch(jump, next);
+      }
+      for (int jump : filterFails) {
         asm.patch(jump, next);
       }
       asm.patch(rewind, asm.here());
@@ -433,7 +485,7 @@ public final class Compiler {
     int loop = asm.here();
     List<Integer> trues = new ArrayList<>();
     List<Integer> fails = new ArrayList<>();
-    emitBool(asm, join.on(), env, trues, fails);
+    emitJoinCondition(asm, join.on(), env, trues, fails);
     int matched = asm.here();
     for (int jump : trues) {
       asm.patch(jump, matched);
@@ -467,6 +519,7 @@ public final class Compiler {
     for (int i = 0; i < select.items().size(); i++) {
       switch (select.items().get(i)) {
         case CountStar ignored -> asm.emit(Opcode.AggCount, acc[i], 0, 0);
+        case CountItem count -> emitCount(asm, acc[i], count, env);
         case MaxItem max -> {
           int value = emitExpr(asm, new ColumnRef(null, max.column()), env);
           asm.emit(Opcode.AggMax, acc[i], value, 0);
@@ -496,8 +549,13 @@ public final class Compiler {
     if (level == 0) {
       int rewind = asm.emit(Opcode.Rewind, source.cursor(), -1, 0);
       int loop = asm.here();
+      List<Integer> filterFails = new ArrayList<>();
+      emitReadyFilters(asm, select.where(), env, 0, filterFails);
       emitLevel(asm, select, env, 1, zero, orderRegs);
-      asm.emit(Opcode.Next, source.cursor(), loop, 0);
+      int next = asm.emit(Opcode.Next, source.cursor(), loop, 0);
+      for (int jump : filterFails) {
+        asm.patch(jump, next);
+      }
       emitEpilogue(asm);
       int halt = asm.emit(Opcode.Halt, 0, 0, 0);
       asm.patch(rewind, halt);
@@ -505,18 +563,36 @@ public final class Compiler {
     }
     Join join = select.joins().get(level - 1);
     if (!join.left()) {
+      if (emitInnerJoinSeek(asm, select, env, level, zero, orderRegs, null, source, join)) {
+        return;
+      }
       int rewind = asm.emit(Opcode.Rewind, source.cursor(), -1, 0);
       int loop = asm.here();
+      List<Integer> filterFails = new ArrayList<>();
+      if (join.on() == null) {
+        emitReadyFilters(asm, select.where(), env, level, filterFails);
+        emitLevel(asm, select, env, level + 1, zero, orderRegs);
+        int next = asm.emit(Opcode.Next, source.cursor(), loop, 0);
+        for (int jump : filterFails) {
+          asm.patch(jump, next);
+        }
+        asm.patch(rewind, asm.here());
+        return;
+      }
       List<Integer> trues = new ArrayList<>();
       List<Integer> fails = new ArrayList<>();
-      emitBool(asm, join.on(), env, trues, fails);
+      emitJoinCondition(asm, join.on(), env, trues, fails);
       int matched = asm.here();
       for (int jump : trues) {
         asm.patch(jump, matched);
       }
+      emitReadyFilters(asm, select.where(), env, level, filterFails);
       emitLevel(asm, select, env, level + 1, zero, orderRegs);
       int next = asm.emit(Opcode.Next, source.cursor(), loop, 0);
       for (int jump : fails) {
+        asm.patch(jump, next);
+      }
+      for (int jump : filterFails) {
         asm.patch(jump, next);
       }
       asm.patch(rewind, asm.here());
@@ -528,7 +604,7 @@ public final class Compiler {
     int loop = asm.here();
     List<Integer> trues = new ArrayList<>();
     List<Integer> fails = new ArrayList<>();
-    emitBool(asm, join.on(), env, trues, fails);
+    emitJoinCondition(asm, join.on(), env, trues, fails);
     int matched = asm.here();
     for (int jump : trues) {
       asm.patch(jump, matched);
@@ -562,6 +638,7 @@ public final class Compiler {
     int width = width(select, env.sources, env.sql);
     int start = asm.allocRange(width);
     writeProjection(asm, select, env, start, env.sql);
+    writeGroupInto(asm, select, env);
     writeOrderInto(asm, select, env, orderRegs);
     asm.emit(Opcode.ResultRow, start, width, 0);
     int skip = asm.here();
@@ -607,7 +684,7 @@ public final class Compiler {
     int loopHead = asm.here();
     List<Integer> fails = new ArrayList<>();
     if (where != null) {
-      if (!epilogue && isAndChain(where)) {
+      if (!epilogue && isSimpleAndChain(where)) {
         for (Predicate predicate : andPredicates(where)) {
           int jump = emitPredicateJump(asm, predicate, env);
           asm.emit(Opcode.Next, CURSOR, loopHead, 0);
@@ -637,12 +714,170 @@ public final class Compiler {
   }
 
   private void emitEpilogue(Assembler asm) {
+    if (!asm.groupRegisters.isEmpty()) {
+      asm.emit(Opcode.Group, 0, 0, 0);
+    }
     if (!asm.orderKeys.isEmpty()) {
       asm.emit(Opcode.Sort, 0, 0, 0);
     }
     if (asm.limitRegister >= 0 || asm.offsetRegister >= 0) {
       asm.emit(Opcode.Limit, 0, 0, 0);
     }
+  }
+
+  private void emitJoinCondition(
+      Assembler asm, Bool on, Env env, List<Integer> onTrue, List<Integer> onFalse) {
+    if (on == null) {
+      onTrue.add(asm.emit(Opcode.Goto, 0, -1, 0));
+      return;
+    }
+    emitBool(asm, on, env, onTrue, onFalse);
+  }
+
+  /**
+   * When the inner table's full primary key is bound by equality predicates from earlier
+   * sources / parameters, seek instead of scanning the cartesian product.
+   */
+  private boolean emitInnerJoinSeek(
+      Assembler asm,
+      Select select,
+      Env env,
+      int level,
+      int zero,
+      List<Integer> orderRegs,
+      int[] acc,
+      Source source,
+      Join join) {
+    Expr[] keys = joinSeekKeys(source, level, join.on(), select.where(), env);
+    if (keys == null) {
+      return false;
+    }
+    int keyStart = asm.allocRange(keys.length);
+    for (int i = 0; i < keys.length; i++) {
+      emitExprInto(asm, keyStart + i, keys[i], env);
+    }
+    int miss = asm.emit(Opcode.SeekPk, source.cursor(), -1, keyStart);
+    List<Integer> filterFails = new ArrayList<>();
+    emitReadyFilters(asm, select.where(), env, level, filterFails);
+    if (acc != null) {
+      emitAggregateLevel(asm, select, env, level + 1, zero, acc);
+    } else {
+      emitLevel(asm, select, env, level + 1, zero, orderRegs);
+    }
+    int after = asm.here();
+    asm.patch(miss, after);
+    for (int jump : filterFails) {
+      asm.patch(jump, after);
+    }
+    return true;
+  }
+
+  /** Emit WHERE conjuncts that only reference sources {@code 0..maxLevel}. */
+  private void emitReadyFilters(
+      Assembler asm, Bool where, Env env, int maxLevel, List<Integer> fails) {
+    if (where == null || !isAndChain(where)) {
+      return;
+    }
+    for (Predicate predicate : andPredicates(where)) {
+      if (predicateMaxSource(predicate, env) > maxLevel) {
+        continue;
+      }
+      List<Integer> trues = new ArrayList<>();
+      List<Integer> localFails = new ArrayList<>();
+      emitBool(asm, new Pred(predicate), env, trues, localFails);
+      int cont = asm.here();
+      for (int jump : trues) {
+        asm.patch(jump, cont);
+      }
+      fails.addAll(localFails);
+    }
+  }
+
+  private Expr[] joinSeekKeys(Source inner, int innerIndex, Bool on, Bool where, Env env) {
+    int[] primaryKey = inner.table().primaryKey();
+    if (primaryKey.length == 0) {
+      return null;
+    }
+    Bool combined = combineAnd(on, where);
+    if (combined == null || !isAndChain(combined)) {
+      return null;
+    }
+    Expr[] keys = new Expr[primaryKey.length];
+    for (Predicate predicate : andPredicates(combined)) {
+      if (!(predicate instanceof Compare compare) || compare.op() != CompareOp.EQ) {
+        continue;
+      }
+      ColumnRef column = null;
+      Expr value = null;
+      if (compare.left() instanceof ColumnRef left && columnSource(left, env) == innerIndex) {
+        column = left;
+        value = compare.right();
+      } else if (compare.right() instanceof ColumnRef right && columnSource(right, env) == innerIndex) {
+        column = right;
+        value = compare.left();
+      }
+      if (column == null || exprMaxSource(value, env) >= innerIndex) {
+        continue;
+      }
+      int index = inner.table().columnIndex(column.name());
+      int position = -1;
+      for (int i = 0; i < primaryKey.length; i++) {
+        if (primaryKey[i] == index) {
+          position = i;
+          break;
+        }
+      }
+      if (index < 0 || position < 0 || keys[position] != null) {
+        continue;
+      }
+      keys[position] = value;
+    }
+    for (Expr key : keys) {
+      if (key == null) {
+        return null;
+      }
+    }
+    return keys;
+  }
+
+  private Bool combineAnd(Bool left, Bool right) {
+    if (left == null) {
+      return right;
+    }
+    if (right == null) {
+      return left;
+    }
+    return new And(left, right);
+  }
+
+  private int columnSource(ColumnRef column, Env env) {
+    return resolve(column, env).source;
+  }
+
+  private int exprMaxSource(Expr expr, Env env) {
+    return switch (expr) {
+      case ColumnRef column -> columnSource(column, env);
+      case Concat concat -> Math.max(exprMaxSource(concat.left(), env), exprMaxSource(concat.right(), env));
+      case IfNullExpr ifNull ->
+          Math.max(exprMaxSource(ifNull.value(), env), exprMaxSource(ifNull.fallback(), env));
+      default -> -1;
+    };
+  }
+
+  private int predicateMaxSource(Predicate predicate, Env env) {
+    return switch (predicate) {
+      case Compare compare -> Math.max(exprMaxSource(compare.left(), env), exprMaxSource(compare.right(), env));
+      case IsNull isNull -> exprMaxSource(isNull.expr(), env);
+      case Like like -> Math.max(exprMaxSource(like.left(), env), exprMaxSource(like.right(), env));
+      case InSubquery in -> {
+        // Defer until all outer sources of the current query are open.
+        int max = exprMaxSource(in.left(), env);
+        if (!env.sources.isEmpty()) {
+          max = Math.max(max, env.sources.size() - 1);
+        }
+        yield max;
+      }
+    };
   }
 
   private void emitBool(Assembler asm, Bool condition, Env env, List<Integer> onTrue, List<Integer> onFalse) {
@@ -665,11 +900,103 @@ public final class Compiler {
         }
         emitBool(asm, and.right(), env, onTrue, onFalse);
       }
+      case Not not -> emitBool(asm, not.condition(), env, onFalse, onTrue);
       case Pred pred -> {
-        onTrue.add(emitPredicateJump(asm, pred.predicate(), env));
-        onFalse.add(asm.emit(Opcode.Goto, 0, -1, 0));
+        if (pred.predicate() instanceof InSubquery in) {
+          emitInSubquery(asm, in, env, onTrue, onFalse);
+        } else {
+          onTrue.add(emitPredicateJump(asm, pred.predicate(), env));
+          onFalse.add(asm.emit(Opcode.Goto, 0, -1, 0));
+        }
       }
     }
+  }
+
+  /**
+   * Compile {@code left [NOT] IN (SELECT col FROM t [WHERE ...])} as a nested scan.
+   * Uses a free cursor so the outer scan can stay open (supports correlation).
+   */
+  private void emitInSubquery(
+      Assembler asm, InSubquery in, Env env, List<Integer> onTrue, List<Integer> onFalse) {
+    Select sub = in.query();
+    if (sub.table() == null || sub.fromSelect() != null) {
+      throw new SqlException("IN subquery needs a base table: " + SqlText.snippet(env.sql));
+    }
+    if (!sub.joins().isEmpty()) {
+      throw new SqlException("IN subquery joins are not supported yet: " + SqlText.snippet(env.sql));
+    }
+    if (sub.items().size() != 1 || !(sub.items().get(0) instanceof ExpressionItem projection)) {
+      throw new SqlException("IN subquery must select one expression: " + SqlText.snippet(env.sql));
+    }
+    if (isAggregate(sub)) {
+      throw new SqlException("IN subquery aggregates are not supported: " + SqlText.snippet(env.sql));
+    }
+
+    int left = emitExpr(asm, in.left(), env);
+    Table table = requireTable(catalogFor(env), sub.table(), env.sql);
+    int cursor = nextCursor(env);
+    List<Source> sources = new ArrayList<>(env.sources);
+    sources.add(new Source(cursor, table, sub.alias()));
+    boolean[] nulled = null;
+    if (env.nulled != null) {
+      nulled = Arrays.copyOf(env.nulled, sources.size());
+    }
+    Env innerEnv = new Env(sources, nulled, env.excludedBase, env.excludedTable, env.sql);
+
+    asm.emit(Opcode.OpenRead, cursor, asm.constant(table.name()), 0);
+    int rewind = asm.emit(Opcode.Rewind, cursor, -1, 0);
+    int loop = asm.here();
+    List<Integer> fails = new ArrayList<>();
+    if (sub.where() != null) {
+      List<Integer> trues = new ArrayList<>();
+      emitBool(asm, sub.where(), innerEnv, trues, fails);
+      int body = asm.here();
+      for (int jump : trues) {
+        asm.patch(jump, body);
+      }
+    }
+    int value = emitExpr(asm, projection.expr(), innerEnv);
+    int match = asm.emit(Opcode.Eq, left, -1, value);
+    int next = asm.emit(Opcode.Next, cursor, loop, 0);
+    for (int jump : fails) {
+      asm.patch(jump, next);
+    }
+
+    if (in.not()) {
+      // No match → true; match → false.
+      int noMatch = asm.emit(Opcode.Goto, 0, -1, 0);
+      onTrue.add(noMatch);
+      onFalse.add(match);
+      asm.patch(rewind, noMatch);
+    } else {
+      // Match → true; no match → false.
+      int noMatch = asm.emit(Opcode.Goto, 0, -1, 0);
+      onTrue.add(match);
+      onFalse.add(noMatch);
+      asm.patch(rewind, noMatch);
+    }
+  }
+
+  private int nextCursor(Env env) {
+    int max = -1;
+    for (Source source : env.sources) {
+      if (source.cursor() > max) {
+        max = source.cursor();
+      }
+    }
+    int cursor = max + 1;
+    if (cursor >= 32) {
+      throw new SqlException("too many open cursors: " + SqlText.snippet(env.sql));
+    }
+    return cursor;
+  }
+
+  /** Catalog is not on Env; resolve table via a side channel stored during compile. */
+  private MemoryCatalog catalogFor(Env env) {
+    if (activeCatalog == null) {
+      throw new IllegalStateException("compiler catalog is not set");
+    }
+    return activeCatalog;
   }
 
   private int emitPredicateJump(Assembler asm, Predicate predicate, Env env) {
@@ -686,8 +1013,11 @@ public final class Compiler {
       case Like like -> {
         int left = emitExpr(asm, like.left(), env);
         int right = emitExpr(asm, like.right(), env);
-        yield asm.emit(Opcode.Like, left, -1, right);
+        int pattern = like.escape() == 0 ? right : (like.escape() << 16) | (right & 0xFFFF);
+        yield asm.emit(Opcode.Like, left, -1, pattern);
       }
+      case InSubquery ignored ->
+          throw new IllegalStateException("InSubquery must be emitted via emitInSubquery");
     };
   }
 
@@ -776,6 +1106,46 @@ public final class Compiler {
         throw new SqlException("aggregate cannot be mixed into this select: " + SqlText.snippet(sql));
       }
       emitExprInto(asm, start + i, expression.expr(), env);
+    }
+  }
+
+  private void prepareGroupRegisters(Assembler asm, Select select) {
+    for (int i = 0; i < select.groupBy().size(); i++) {
+      asm.groupRegisters.add(asm.alloc());
+    }
+  }
+
+  private void writeGroupInto(Assembler asm, Select select, Env env) {
+    for (int i = 0; i < select.groupBy().size(); i++) {
+      emitExprInto(asm, asm.groupRegisters.get(i), select.groupBy().get(i), env);
+    }
+  }
+
+  private void initCount(Assembler asm, int[] acc, int index, boolean distinct) {
+    acc[index] = asm.alloc();
+    if (distinct) {
+      asm.emit(Opcode.Null, acc[index], 0, 0);
+    } else {
+      asm.emit(Opcode.Integer, acc[index], 0, 0);
+    }
+  }
+
+  private void emitCount(Assembler asm, int acc, CountItem count, Env env) {
+    int value = emitExpr(asm, count.expr(), env);
+    if (count.distinct()) {
+      asm.emit(Opcode.AggCountDistinct, acc, value, 0);
+    } else {
+      asm.emit(Opcode.AggCount, acc, value, 1);
+    }
+  }
+
+  private void storeAggregate(Assembler asm, SelectItem item, int acc, int dest) {
+    if (item instanceof CountItem count && count.distinct()) {
+      asm.emit(Opcode.AggCard, acc, 0, dest);
+      return;
+    }
+    if (acc >= 0) {
+      asm.emit(Opcode.IfNullValue, acc, acc, dest);
     }
   }
 
@@ -952,7 +1322,7 @@ public final class Compiler {
 
   private boolean isAggregate(Select select) {
     for (SelectItem item : select.items()) {
-      if (item instanceof CountStar || item instanceof MaxItem) {
+      if (item instanceof CountStar || item instanceof CountItem || item instanceof MaxItem) {
         return true;
       }
     }
@@ -960,14 +1330,28 @@ public final class Compiler {
   }
 
   private boolean hasEpilogue(Select select) {
-    return select.limit() != null || select.offset() != null || !select.orderBy().isEmpty();
+    return select.limit() != null
+        || select.offset() != null
+        || !select.orderBy().isEmpty()
+        || !select.groupBy().isEmpty();
   }
 
   private boolean isAndChain(Bool condition) {
     return switch (condition) {
       case And and -> isAndChain(and.left()) && isAndChain(and.right());
       case Or ignored -> false;
+      case Not ignored -> false;
       case Pred ignored -> true;
+    };
+  }
+
+  /** AND of simple predicates (no IN-subquery) — eligible for the emitScan fast path. */
+  private boolean isSimpleAndChain(Bool condition) {
+    return switch (condition) {
+      case And and -> isSimpleAndChain(and.left()) && isSimpleAndChain(and.right());
+      case Or ignored -> false;
+      case Not ignored -> false;
+      case Pred pred -> !(pred.predicate() instanceof InSubquery);
     };
   }
 
@@ -985,6 +1369,7 @@ public final class Compiler {
       }
       case Pred pred -> predicates.add(pred.predicate());
       case Or ignored -> throw new IllegalStateException("OR is not an AND chain");
+      case Not ignored -> throw new IllegalStateException("NOT is not an AND chain");
     }
   }
 
@@ -1048,7 +1433,8 @@ public final class Compiler {
       }
       return;
     }
-    if (column.type() == ColumnType.INTEGER && !(literal instanceof NumberLiteral)) {
+    if ((column.type() == ColumnType.INTEGER || column.type() == ColumnType.REAL)
+        && !(literal instanceof NumberLiteral)) {
       throw new SqlException("type mismatch for " + column.name() + ": " + SqlText.snippet(sql));
     }
     if (column.type() == ColumnType.TEXT && !(literal instanceof StringLiteral)) {
@@ -1101,6 +1487,7 @@ public final class Compiler {
     private final List<Instruction> code = new ArrayList<>();
     private final List<Object> constants = new ArrayList<>();
     private final List<OrderKey> orderKeys = new ArrayList<>();
+    private final List<Integer> groupRegisters = new ArrayList<>();
     private int registers;
     private int limitRegister = -1;
     private int offsetRegister = -1;
@@ -1158,12 +1545,17 @@ public final class Compiler {
     }
 
     Program build(List<String> resultColumns) {
+      int[] groups = new int[groupRegisters.size()];
+      for (int i = 0; i < groups.length; i++) {
+        groups[i] = groupRegisters.get(i);
+      }
       return new Program(
           code,
           constants,
           resultColumns,
           registers,
           orderKeys,
+          groups,
           limitRegister,
           offsetRegister,
           insertMode,

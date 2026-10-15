@@ -237,6 +237,63 @@ class MemorySqlTest {
     }
   }
 
+  @Test
+  void inSubqueryFiltersRows() {
+    try (Database db = open()) {
+      db.execute("CREATE TABLE users (id INTEGER, name TEXT)");
+      db.execute("CREATE TABLE roles (userId INTEGER, roleId INTEGER)");
+      db.execute("INSERT INTO users VALUES (1, 'a')");
+      db.execute("INSERT INTO users VALUES (2, 'b')");
+      db.execute("INSERT INTO users VALUES (3, 'c')");
+      db.execute("INSERT INTO roles VALUES (1, 10)");
+      db.execute("INSERT INTO roles VALUES (3, 10)");
+      db.execute("INSERT INTO roles VALUES (2, 20)");
+
+      assertEquals(
+          List.of(1L, 3L),
+          values(db.query("SELECT id FROM users WHERE id IN (SELECT userId FROM roles WHERE roleId = 10)")));
+      assertEquals(
+          List.of(2L),
+          values(db.query("SELECT id FROM users WHERE id NOT IN (SELECT userId FROM roles WHERE roleId = 10)")));
+      assertEquals(
+          3,
+          db.query("SELECT userId FROM roles WHERE userId IN (SELECT id FROM users)").size());
+    }
+  }
+
+  @Test
+  void keywordColumnGroupByAndCountDistinct() {
+    try (Database db = open()) {
+      db.execute("CREATE TABLE message (id INTEGER, datetime TEXT)");
+      db.execute("INSERT INTO message (id, datetime) VALUES (1, '2026-10-15 09:21:02')");
+      Row message = db.query(
+          "SELECT messageent0_.id, messageent0_.datetime FROM message messageent0_").get(0);
+      assertEquals(List.of(1L, "2026-10-15 09:21:02"), message.values());
+
+      db.execute("CREATE TABLE log (username TEXT, tname TEXT, type INTEGER)");
+      db.execute("INSERT INTO log VALUES ('a', 'r1', 1)");
+      db.execute("INSERT INTO log VALUES ('a', 'r1', 1)");
+      db.execute("INSERT INTO log VALUES ('a', 'r2', 1)");
+      db.execute("INSERT INTO log VALUES ('b', 'r1', 2)");
+      db.execute("INSERT INTO log VALUES ('c', 'r9', 9)");
+      db.execute("INSERT INTO log VALUES ('d', NULL, 1)");
+
+      List<Row> grouped = db.query(
+          "SELECT username, tname FROM log WHERE type IN (1 , 2) GROUP BY username, tname");
+      assertEquals(4, grouped.size());
+      assertEquals(List.of("a", "r1"), grouped.get(0).values());
+      assertEquals(List.of("a", "r2"), grouped.get(1).values());
+      assertEquals(List.of("b", "r1"), grouped.get(2).values());
+      assertEquals("d", grouped.get(3).values().get(0));
+      assertNull(grouped.get(3).values().get(1));
+
+      assertEquals(2L, db.query(
+          "SELECT count(distinct tname) FROM log WHERE type IN (1, 2)").get(0).values().get(0));
+      assertEquals(5L, db.query("SELECT count(tname) FROM log").get(0).values().get(0));
+      assertEquals(6L, db.query("SELECT count(*) FROM log").get(0).values().get(0));
+    }
+  }
+
   private static Database open() {
     return Database.open(Path.of("mem"));
   }

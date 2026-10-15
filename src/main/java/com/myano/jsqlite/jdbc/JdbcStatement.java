@@ -22,7 +22,8 @@ final class JdbcStatement {
   private final boolean generatedKeys;
   private final Object[] parameters;
   private final boolean[] bound;
-  private final List<Object[]> batch = new ArrayList<>();
+  private final List<Object[]> preparedBatch = new ArrayList<>();
+  private final List<String> statementBatch = new ArrayList<>();
   private boolean closed;
   private Database.Outcome outcome;
 
@@ -71,15 +72,25 @@ final class JdbcStatement {
       case "setLong" -> setValue(method, args, longValue(args));
       case "setBoolean" -> setValue(method, args, boolValue(args));
       case "setTimestamp" -> setTimestamp(method, args);
-      case "setFetchSize", "setMaxRows" -> ignoreIntSetter(method, args);
-      case "getFetchSize", "getMaxRows" -> 0;
+      case "setBytes", "setDouble", "setFloat", "setBigDecimal", "setDate", "setTime", "setBlob",
+          "setBinaryStream" -> setCoerced(method, args);
+      case "setFetchSize", "setMaxRows", "setQueryTimeout", "setFetchDirection", "setMaxFieldSize" ->
+          ignoreIntSetter(method, args);
+      case "getFetchSize", "getMaxRows", "getQueryTimeout", "getFetchDirection", "getMaxFieldSize" -> 0;
+      case "getWarnings", "clearWarnings", "cancel", "getMoreResults" -> {
+        if (args.length != 0) {
+          throw JdbcProxy.unsupported(method);
+        }
+        yield method.getName().equals("getMoreResults") ? Boolean.FALSE : null;
+      }
       case "addBatch" -> addBatch(method, args);
       case "executeBatch" -> executeBatch(method, args);
       case "clearBatch" -> {
         if (args.length != 0) {
           throw JdbcProxy.unsupported(method);
         }
-        batch.clear();
+        preparedBatch.clear();
+        statementBatch.clear();
         yield null;
       }
       case "clearParameters" -> {
@@ -95,18 +106,25 @@ final class JdbcStatement {
   }
 
   private Object addBatch(Method method, Object[] args) throws SQLException {
+    if (args.length == 1 && args[0] instanceof String sql) {
+      if (preparedSql != null) {
+        throw new SQLException("PreparedStatement.addBatch does not take SQL");
+      }
+      statementBatch.add(sql);
+      return null;
+    }
     if (args.length != 0) {
       throw JdbcProxy.unsupported(method);
     }
     if (preparedSql == null) {
-      throw new SQLException("addBatch requires a prepared statement");
+      throw new SQLException("addBatch without SQL requires a prepared statement");
     }
     for (int i = 0; i < bound.length; i++) {
       if (!bound[i]) {
         throw new SQLException("parameter " + (i + 1) + " is not set");
       }
     }
-    batch.add(parameters.clone());
+    preparedBatch.add(parameters.clone());
     return null;
   }
 
@@ -114,18 +132,27 @@ final class JdbcStatement {
     if (args.length != 0) {
       throw JdbcProxy.unsupported(method);
     }
-    if (preparedSql == null) {
-      throw new SQLException("executeBatch requires a prepared statement");
+    if (preparedSql != null) {
+      int[] counts = new int[preparedBatch.size()];
+      for (int i = 0; i < preparedBatch.size(); i++) {
+        outcome = database.run(preparedSql, preparedBatch.get(i));
+        if (outcome.hasResultSet()) {
+          throw new SQLException("batch statement returned a result set");
+        }
+        counts[i] = outcome.updateCount();
+      }
+      preparedBatch.clear();
+      return counts;
     }
-    int[] counts = new int[batch.size()];
-    for (int i = 0; i < batch.size(); i++) {
-      outcome = database.run(preparedSql, batch.get(i));
+    int[] counts = new int[statementBatch.size()];
+    for (int i = 0; i < statementBatch.size(); i++) {
+      outcome = database.run(statementBatch.get(i));
       if (outcome.hasResultSet()) {
         throw new SQLException("batch statement returned a result set");
       }
       counts[i] = outcome.updateCount();
     }
-    batch.clear();
+    statementBatch.clear();
     return counts;
   }
 
@@ -137,11 +164,26 @@ final class JdbcStatement {
   }
 
   private Object setTimestamp(Method method, Object[] args) throws SQLException {
-    if (args.length != 2) {
+    if (args.length < 2 || args.length > 3) {
       throw JdbcProxy.unsupported(method);
     }
+    return setCoerced(method, args);
+  }
+
+  private Object setCoerced(Method method, Object[] args) throws SQLException {
+    if (args.length < 2 || !(args[0] instanceof Integer)) {
+      throw JdbcProxy.unsupported(method);
+    }
+    Object value = args[1];
+    if (value instanceof java.io.InputStream stream) {
+      try {
+        value = stream.readAllBytes();
+      } catch (java.io.IOException ex) {
+        throw new SQLException(ex.getMessage(), ex);
+      }
+    }
     try {
-      bind(method, args, Bindings.coerce(args[1]));
+      bind(method, args, Bindings.coerce(value));
     } catch (SqlException ex) {
       throw new SQLException(ex.getMessage(), ex);
     }
@@ -199,7 +241,7 @@ final class JdbcStatement {
   }
 
   private Object setObject(Method method, Object[] args) throws SQLException {
-    if (args.length != 2) {
+    if (args.length < 2 || args.length > 3) {
       throw JdbcProxy.unsupported(method);
     }
     try {
@@ -211,7 +253,7 @@ final class JdbcStatement {
   }
 
   private Object setNull(Method method, Object[] args) throws SQLException {
-    if (args.length != 2) {
+    if (args.length < 2 || args.length > 3) {
       throw JdbcProxy.unsupported(method);
     }
     bind(method, args, null);

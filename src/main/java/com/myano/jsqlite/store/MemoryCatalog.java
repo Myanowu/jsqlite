@@ -246,10 +246,21 @@ public final class MemoryCatalog {
   }
 
   public void dropTable(String name) {
+    dropTable(name, true, "");
+  }
+
+  public void dropTable(String name, boolean ifExists, String sql) {
     if (name == null) {
       return;
     }
-    tables.remove(key(name));
+    String id = key(name);
+    if (tables.remove(id) == null) {
+      if (ifExists) {
+        return;
+      }
+      throw new SqlException("unknown table " + name + ": " + SqlText.snippet(sql));
+    }
+    indexes.removeIf(index -> key(index.table()).equals(id));
   }
 
   /** Temporary table filled from a derived SELECT; not persisted unless a later write syncs. */
@@ -279,6 +290,12 @@ public final class MemoryCatalog {
       Object value = row[column];
       if (value instanceof Long) {
         return ColumnType.INTEGER;
+      }
+      if (value instanceof Double) {
+        return ColumnType.REAL;
+      }
+      if (value instanceof byte[]) {
+        return ColumnType.BLOB;
       }
       if (value instanceof String) {
         return ColumnType.TEXT;
@@ -590,12 +607,37 @@ public final class MemoryCatalog {
         }
       }
     }
+    if (column.type() == ColumnType.REAL) {
+      if (value instanceof Long || value instanceof Double) {
+        return value;
+      }
+      if (value instanceof String text) {
+        try {
+          return Long.parseLong(text);
+        } catch (NumberFormatException ignored) {
+          try {
+            return Double.parseDouble(text);
+          } catch (NumberFormatException ex) {
+            throw new SqlException("type mismatch for " + column.name() + ": " + SqlText.snippet(sql));
+          }
+        }
+      }
+    }
+    if (column.type() == ColumnType.BLOB && value instanceof byte[] raw) {
+      return raw;
+    }
     if (column.type() == ColumnType.TEXT) {
       if (value instanceof String text) {
         return text;
       }
       if (value instanceof Long number) {
         return Long.toString(number);
+      }
+      if (value instanceof Double number) {
+        return Double.toString(number);
+      }
+      if (value instanceof byte[] raw) {
+        return new String(raw, java.nio.charset.StandardCharsets.UTF_8);
       }
     }
     throw new SqlException("type mismatch for " + column.name() + ": " + SqlText.snippet(sql));

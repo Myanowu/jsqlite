@@ -12,6 +12,7 @@ import com.myano.jsqlite.sql.Ast.Delete;
 import com.myano.jsqlite.sql.Ast.Expr;
 import com.myano.jsqlite.sql.Ast.ExpressionItem;
 import com.myano.jsqlite.sql.Ast.IfNullExpr;
+import com.myano.jsqlite.sql.Ast.InSubquery;
 import com.myano.jsqlite.sql.Ast.Insert;
 import com.myano.jsqlite.sql.Ast.IsNull;
 import com.myano.jsqlite.sql.Ast.Join;
@@ -35,6 +36,8 @@ public final class Parameters {
       case CreateTable ignored -> 0;
       case CreateIndex ignored -> 0;
       case AlterTable ignored -> 0;
+      case Ast.DropTable ignored -> 0;
+      case Ast.Shutdown ignored -> 0;
       case Insert insert -> countInsert(insert);
       case Select select -> countSelect(select);
       case Update update -> countUpdate(update);
@@ -93,10 +96,12 @@ public final class Parameters {
     return switch (condition) {
       case Ast.And and -> countBool(and.left()) + countBool(and.right());
       case Ast.Or or -> countBool(or.left()) + countBool(or.right());
+      case Ast.Not not -> countBool(not.condition());
       case Pred pred -> switch (pred.predicate()) {
         case Compare compare -> countExpr(compare.left()) + countExpr(compare.right());
         case IsNull isNull -> countExpr(isNull.expr());
         case Like like -> countExpr(like.left()) + countExpr(like.right());
+        case InSubquery in -> countExpr(in.left()) + countSelect(in.query());
       };
     };
   }

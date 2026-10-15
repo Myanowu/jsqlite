@@ -3,9 +3,11 @@ package com.myano.jsqlite.sql;
 import com.myano.jsqlite.SqlException;
 
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 public final class Tokenizer {
   private static final Map<String, TokenType> KEYWORDS = Map.ofEntries(
@@ -40,7 +42,9 @@ public final class Tokenizer {
       Map.entry("JOIN", TokenType.JOIN),
       Map.entry("INNER", TokenType.INNER),
       Map.entry("LEFT", TokenType.LEFT),
+      Map.entry("CROSS", TokenType.CROSS),
       Map.entry("ORDER", TokenType.ORDER),
+      Map.entry("GROUP", TokenType.GROUP),
       Map.entry("BY", TokenType.BY),
       Map.entry("LIMIT", TokenType.LIMIT),
       Map.entry("OFFSET", TokenType.OFFSET),
@@ -55,6 +59,7 @@ public final class Tokenizer {
       Map.entry("IS", TokenType.IS),
       Map.entry("IN", TokenType.IN),
       Map.entry("LIKE", TokenType.LIKE),
+      Map.entry("ESCAPE", TokenType.ESCAPE),
       Map.entry("IFNULL", TokenType.IFNULL),
       Map.entry("COALESCE", TokenType.COALESCE),
       Map.entry("DATETIME", TokenType.DATETIME),
@@ -63,7 +68,18 @@ public final class Tokenizer {
       Map.entry("REFERENCES", TokenType.REFERENCES),
       Map.entry("FOREIGN", TokenType.FOREIGN),
       Map.entry("CONSTRAINT", TokenType.CONSTRAINT),
-      Map.entry("PRAGMA", TokenType.PRAGMA));
+      Map.entry("PRAGMA", TokenType.PRAGMA),
+      Map.entry("DROP", TokenType.DROP),
+      Map.entry("SHUTDOWN", TokenType.SHUTDOWN),
+      Map.entry("FOR", TokenType.FOR),
+      Map.entry("TRUE", TokenType.TRUE),
+      Map.entry("FALSE", TokenType.FALSE));
+
+  private static final Set<TokenType> KEYWORD_TYPES = EnumSet.copyOf(KEYWORDS.values());
+
+  public static boolean isKeyword(TokenType type) {
+    return KEYWORD_TYPES.contains(type);
+  }
 
   private final String sql;
   private int pos;

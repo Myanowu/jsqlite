@@ -9,6 +9,7 @@ public final class Program {
   private final List<String> resultColumns;
   private final int registerCount;
   private final List<OrderKey> orderKeys;
+  private final int[] groupRegisters;
   private final int limitRegister;
   private final int offsetRegister;
   private final InsertMode insertMode;
@@ -26,6 +27,7 @@ public final class Program {
         resultColumns,
         registerCount,
         List.of(),
+        new int[0],
         -1,
         -1,
         InsertMode.APPEND,
@@ -39,6 +41,7 @@ public final class Program {
       List<String> resultColumns,
       int registerCount,
       List<OrderKey> orderKeys,
+      int[] groupRegisters,
       int limitRegister,
       int offsetRegister,
       InsertMode insertMode,
@@ -49,6 +52,7 @@ public final class Program {
     this.resultColumns = List.copyOf(resultColumns);
     this.registerCount = registerCount;
     this.orderKeys = List.copyOf(orderKeys);
+    this.groupRegisters = groupRegisters.clone();
     this.limitRegister = limitRegister;
     this.offsetRegister = offsetRegister;
     this.insertMode = insertMode;
@@ -90,6 +94,10 @@ public final class Program {
 
   public List<OrderKey> orderKeys() {
     return orderKeys;
+  }
+
+  public int[] groupRegisters() {
+    return groupRegisters.clone();
   }
 
   public int limitRegister() {

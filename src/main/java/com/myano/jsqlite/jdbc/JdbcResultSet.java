@@ -52,8 +52,24 @@ final class JdbcResultSet {
       case "getInt" -> integer(args);
       case "getLong" -> longValue(args);
       case "getBoolean" -> bool(args);
+      case "getDouble" -> doubleValue(args);
+      case "getFloat" -> (float) doubleValue(args);
+      case "getBytes" -> bytes(args);
+      case "getBigDecimal" -> decimal(args);
+      case "getBlob" -> blob(args);
+      case "getDate" -> date(args);
+      case "getTime" -> time(args);
       case "getTimestamp" -> timestamp(args);
       case "getObject" -> object(args);
+      case "getWarnings", "clearWarnings" -> {
+        if (args.length != 0) {
+          throw new SQLException("ResultSet." + method.getName());
+        }
+        yield null;
+      }
+      case "getRow" -> cursor + 1;
+      case "isBeforeFirst" -> cursor < 0;
+      case "isAfterLast" -> cursor >= rows.size();
       default -> throw JdbcProxy.unsupported(method);
     };
   }
@@ -120,11 +136,57 @@ final class JdbcResultSet {
     return JdbcValues.bool(value);
   }
 
+  private double doubleValue(Object[] args) throws SQLException {
+    Object value = cell(args);
+    wasNull = value == null;
+    return JdbcValues.real(value);
+  }
+
+  private byte[] bytes(Object[] args) throws SQLException {
+    Object value = cell(args);
+    wasNull = value == null;
+    return JdbcValues.bytes(value);
+  }
+
+  private Object decimal(Object[] args) throws SQLException {
+    Object value = cell(args.length > 1 ? new Object[] {args[0]} : args);
+    wasNull = value == null;
+    return JdbcValues.decimal(value);
+  }
+
+  private Object blob(Object[] args) throws SQLException {
+    byte[] raw = bytes(args);
+    if (raw == null) {
+      return null;
+    }
+    try {
+      return new javax.sql.rowset.serial.SerialBlob(raw);
+    } catch (SQLException ex) {
+      throw new SQLException(ex.getMessage(), ex);
+    }
+  }
+
+  private Object date(Object[] args) throws SQLException {
+    Object stamp = timestamp(args);
+    if (!(stamp instanceof java.sql.Timestamp time)) {
+      return null;
+    }
+    return new java.sql.Date(time.getTime());
+  }
+
+  private Object time(Object[] args) throws SQLException {
+    Object stamp = timestamp(args);
+    if (!(stamp instanceof java.sql.Timestamp time)) {
+      return null;
+    }
+    return new java.sql.Time(time.getTime());
+  }
+
   private Object timestamp(Object[] args) throws SQLException {
-    if (args.length != 1) {
+    if (args.length < 1 || args.length > 2) {
       throw new SQLException("ResultSet.getTimestamp");
     }
-    Object value = cell(args);
+    Object value = cell(new Object[] {args[0]});
     wasNull = value == null;
     return JdbcValues.timestamp(value);
   }

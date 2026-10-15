@@ -50,7 +50,9 @@ public enum TokenType {
   JOIN,
   INNER,
   LEFT,
+  CROSS,
   ORDER,
+  GROUP,
   BY,
   LIMIT,
   OFFSET,
@@ -65,6 +67,7 @@ public enum TokenType {
   IS,
   IN,
   LIKE,
+  ESCAPE,
   IFNULL,
   COALESCE,
   DATETIME,
@@ -73,5 +76,10 @@ public enum TokenType {
   REFERENCES,
   FOREIGN,
   CONSTRAINT,
-  PRAGMA
+  PRAGMA,
+  DROP,
+  SHUTDOWN,
+  FOR,
+  TRUE,
+  FALSE
 }

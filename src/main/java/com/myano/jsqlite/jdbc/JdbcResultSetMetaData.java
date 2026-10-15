@@ -43,6 +43,10 @@ final class JdbcResultSetMetaData {
       case "getScale" -> scale(method, args);
       case "isNullable" -> nullable(method, args);
       case "isAutoIncrement" -> autoIncrement(method, args);
+      case "getColumnClassName" -> className(method, args);
+      case "isSigned", "isCurrency", "isSearchable", "isCaseSensitive", "isReadOnly", "isWritable",
+          "isDefinitelyWritable" -> false;
+      case "getColumnDisplaySize" -> 0;
       default -> throw JdbcProxy.unsupported(method);
     };
   }
@@ -60,7 +64,7 @@ final class JdbcResultSetMetaData {
   private String typeName(Method method, Object[] args) throws SQLException {
     Column column = schemaColumn(method, args);
     if (column != null) {
-      return column.type() == ColumnType.TEXT ? "TEXT" : "INTEGER";
+      return column.type().name();
     }
     if (args.length != 1 || !(args[0] instanceof Integer index)) {
       throw JdbcProxy.unsupported(method);
@@ -83,12 +87,14 @@ final class JdbcResultSetMetaData {
   private int columnType(Method method, Object[] args) throws SQLException {
     Column column = schemaColumn(method, args);
     if (column != null) {
-      return column.type() == ColumnType.TEXT ? Types.VARCHAR : Types.INTEGER;
+      return jdbcType(column.type());
     }
     String name = typeName(method, args);
     return switch (name) {
       case "INTEGER" -> Types.INTEGER;
       case "TEXT" -> Types.VARCHAR;
+      case "REAL" -> Types.DOUBLE;
+      case "BLOB" -> Types.BLOB;
       default -> Types.NULL;
     };
   }
@@ -96,7 +102,7 @@ final class JdbcResultSetMetaData {
   private int precision(Method method, Object[] args) throws SQLException {
     Column column = schemaColumn(method, args);
     if (column != null) {
-      return column.type() == ColumnType.TEXT ? 0 : 19;
+      return column.type() == ColumnType.INTEGER || column.type() == ColumnType.REAL ? 19 : 0;
     }
     return 0;
   }
@@ -115,6 +121,25 @@ final class JdbcResultSetMetaData {
       return ResultSetMetaData.columnNoNulls;
     }
     return ResultSetMetaData.columnNullable;
+  }
+
+  private String className(Method method, Object[] args) throws SQLException {
+    return switch (typeName(method, args)) {
+      case "INTEGER" -> "java.lang.Long";
+      case "REAL" -> "java.lang.Double";
+      case "BLOB" -> "[B";
+      case "TEXT" -> "java.lang.String";
+      default -> "java.lang.Object";
+    };
+  }
+
+  private static int jdbcType(ColumnType type) {
+    return switch (type) {
+      case INTEGER -> Types.INTEGER;
+      case TEXT -> Types.VARCHAR;
+      case REAL -> Types.DOUBLE;
+      case BLOB -> Types.BLOB;
+    };
   }
 
   private boolean autoIncrement(Method method, Object[] args) throws SQLException {

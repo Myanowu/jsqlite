@@ -57,7 +57,7 @@ public enum Opcode {
   IfNull,
   /** r[p1] 不是 null 则跳到 p2。 */
   NotNull,
-  /** 文本 r[p1] 匹配模式 r[p3] 则跳到 p2。ASCII 不区分大小写。 */
+  /** 文本 r[p1] 匹配模式 r[p3 低 16 位] 则跳到 p2。p3 高 16 位是 ESCAPE 字元，0 表示没有。 */
   Like,
   /** r[p3] = r[p1] || r[p2]。任一侧是 null 则结果是 null。 */
   Concat,
@@ -74,5 +74,11 @@ public enum Opcode {
   /** 按程序里的排序键重排已经产出的行。 */
   Sort,
   /** 用程序里的 LIMIT / OFFSET 寄存器截断结果。 */
-  Limit
+  Limit,
+  /** 把扫描期间按分组键收起来的行写进结果。 */
+  Group,
+  /** r[p1] 这个集合加入 r[p2]。null 不计。 */
+  AggCountDistinct,
+  /** r[p3] = r[p1] 集合的元素个数。空集合是 0。 */
+  AggCard
 }

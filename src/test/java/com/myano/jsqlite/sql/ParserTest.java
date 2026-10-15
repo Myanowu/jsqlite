@@ -5,9 +5,12 @@ import com.myano.jsqlite.sql.Ast.And;
 import com.myano.jsqlite.sql.Ast.ColumnRef;
 import com.myano.jsqlite.sql.Ast.Compare;
 import com.myano.jsqlite.sql.Ast.CompareOp;
+import com.myano.jsqlite.sql.Ast.CountItem;
+import com.myano.jsqlite.sql.Ast.CountStar;
 import com.myano.jsqlite.sql.Ast.CreateTable;
 import com.myano.jsqlite.sql.Ast.Delete;
 import com.myano.jsqlite.sql.Ast.ExpressionItem;
+import com.myano.jsqlite.sql.Ast.InSubquery;
 import com.myano.jsqlite.sql.Ast.Insert;
 import com.myano.jsqlite.sql.Ast.LiteralExpr;
 import com.myano.jsqlite.sql.Ast.NullLiteral;
@@ -106,5 +109,74 @@ class ParserTest {
             .get(0));
     assertThrows(
         SqlException.class, () -> parser.parse("INSERT INTO t VALUES (9223372036854775808)"));
+  }
+
+  @Test
+  void parsesCountStarAlias() {
+    Select select = assertInstanceOf(
+        Select.class,
+        parser.parse(
+            "select count(*) as col_0_0_ from PUBLIC.t_mdt_user u where u.id in (select distinct r.userId from PUBLIC.t_mdt_user_role_middle r)"));
+    CountStar count = assertInstanceOf(CountStar.class, select.items().get(0));
+    assertEquals("col_0_0_", count.alias());
+    assertEquals("t_mdt_user", select.table());
+    assertInstanceOf(InSubquery.class, assertInstanceOf(Pred.class, select.where()).predicate());
+  }
+
+  @Test
+  void parsesInSubquery() {
+    Select select = assertInstanceOf(
+        Select.class,
+        parser.parse("SELECT id FROM users WHERE id IN (SELECT DISTINCT userId FROM roles WHERE roleId = 1)"));
+    Pred pred = assertInstanceOf(Pred.class, select.where());
+    InSubquery in = assertInstanceOf(InSubquery.class, pred.predicate());
+    assertEquals("id", ((ColumnRef) in.left()).name());
+    assertTrue(in.query().distinct());
+    assertEquals("roles", in.query().table());
+    assertTrue(!in.not());
+
+    Select notIn = assertInstanceOf(
+        Select.class,
+        parser.parse("SELECT id FROM users WHERE id NOT IN (SELECT userId FROM roles)"));
+    InSubquery negated =
+        assertInstanceOf(InSubquery.class, assertInstanceOf(Pred.class, notIn.where()).predicate());
+    assertTrue(negated.not());
+  }
+
+  @Test
+  void parsesKeywordColumnAndGroupedHibernateSelect() {
+    Select messages = assertInstanceOf(
+        Select.class,
+        parser.parse(
+            "select messageent0_.id as id1_3_, messageent0_.datetime as datetime3_3_ "
+                + "from PUBLIC.message messageent0_"));
+    ColumnRef datetime = assertInstanceOf(
+        ColumnRef.class, assertInstanceOf(ExpressionItem.class, messages.items().get(1)).expr());
+    assertEquals("messageent0_", datetime.table());
+    assertEquals("datetime", datetime.name());
+    assertTrue(messages.groupBy().isEmpty());
+
+    Select grouped = assertInstanceOf(
+        Select.class,
+        parser.parse(
+            "select executemes0_.username as col_0_0_, executemes0_.tname as col_1_0_ "
+                + "from PUBLIC.mdt_record_execute executemes0_ "
+                + "where (executemes0_.type in (? , ? , ? , ?)) "
+                + "group by executemes0_.username , executemes0_.tname"));
+    assertEquals("mdt_record_execute", grouped.table());
+    assertEquals("executemes0_", grouped.alias());
+    assertEquals(2, grouped.groupBy().size());
+    assertEquals("username", ((ColumnRef) grouped.groupBy().get(0)).name());
+    assertEquals("tname", ((ColumnRef) grouped.groupBy().get(1)).name());
+
+    Select distinct = assertInstanceOf(
+        Select.class,
+        parser.parse(
+            "select count(distinct executemes0_.tname) as col_0_0_ "
+                + "from PUBLIC.mdt_record_execute executemes0_"));
+    CountItem count = assertInstanceOf(CountItem.class, distinct.items().get(0));
+    assertTrue(count.distinct());
+    assertEquals("col_0_0_", count.alias());
+    assertEquals("tname", ((ColumnRef) count.expr()).name());
   }
 }
