@@ -86,6 +86,8 @@ public final class MemoryCatalog {
     }
     if (unique) {
       table.addUnique(indexes, partial);
+    } else {
+      table.addNonUniqueIndex(indexes, partial);
     }
     this.indexes.add(new IndexDef(name, table.name(), columns, unique, partialColumn, sql));
   }

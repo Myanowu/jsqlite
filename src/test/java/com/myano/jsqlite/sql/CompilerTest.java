@@ -75,11 +75,36 @@ class CompilerTest {
         scan.opcodes());
   }
 
+  @Test
+  void primaryKeyEqualityUsesSeekEvenWithExtraFilters() {
+    Program program =
+        compile(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, flag INTEGER)",
+            "SELECT id FROM t WHERE id = 1 AND flag = 0");
+    assertTrue(program.opcodes().contains(Opcode.SeekPk));
+    assertFalse(program.opcodes().contains(Opcode.Rewind));
+  }
+
+  @Test
+  void secondaryIndexEqualityUsesSeekIdx() {
+    String createSql = "CREATE TABLE claims (id INTEGER PRIMARY KEY, userId TEXT)";
+    MemoryCatalog catalog = new MemoryCatalog();
+    CreateTable table = (CreateTable) new Parser().parse(createSql);
+    catalog.createTable(table.name(), table.columns(), table.constraints(), false, createSql);
+    catalog.createIndex(
+        "ix_claims_user", false, false, "claims", List.of("userId"), null, "CREATE INDEX");
+    String sql = "SELECT id FROM claims WHERE userId = ?";
+    Program program = new Compiler().compile(new Parser().parse(sql), catalog, sql);
+    assertTrue(program.opcodes().contains(Opcode.SeekIdx));
+    assertTrue(program.opcodes().contains(Opcode.NextIdx));
+    assertFalse(program.opcodes().contains(Opcode.Rewind));
+  }
+
   private static Program compile(String createSql, String sql) {
     MemoryCatalog catalog = new MemoryCatalog();
     Statement create = new Parser().parse(createSql);
     CreateTable table = (CreateTable) create;
-    catalog.createTable(table.name(), table.columns(), createSql);
+    catalog.createTable(table.name(), table.columns(), table.constraints(), false, createSql);
     return new Compiler().compile(new Parser().parse(sql), catalog, sql);
   }
 }

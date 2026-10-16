@@ -294,6 +294,30 @@ class MemorySqlTest {
     }
   }
 
+  @Test
+  void primaryKeySeekKeepsResidualFilters() {
+    try (Database db = open()) {
+      db.execute("CREATE TABLE users (id TEXT PRIMARY KEY, active INTEGER)");
+      db.execute("INSERT INTO users VALUES ('a', 1)");
+      db.execute("INSERT INTO users VALUES ('b', 0)");
+      assertEquals(1, db.query("SELECT id FROM users WHERE id = ? AND active = 1", "a").size());
+      assertEquals(0, db.query("SELECT id FROM users WHERE id = ? AND active = 1", "b").size());
+    }
+  }
+
+  @Test
+  void secondaryIndexFiltersWithoutScanningWholeTable() {
+    try (Database db = open()) {
+      db.execute("CREATE TABLE claims (id INTEGER PRIMARY KEY, userId TEXT, claim TEXT)");
+      db.execute("CREATE INDEX ix_claims_user ON claims (userId)");
+      for (int i = 0; i < 200; i++) {
+        db.execute("INSERT INTO claims (userId, claim) VALUES (?, ?)", "u" + (i % 20), "c" + i);
+      }
+      assertEquals(10, db.query("SELECT id FROM claims WHERE userId = ?", "u7").size());
+      assertEquals(0, db.query("SELECT id FROM claims WHERE userId = ?", "missing").size());
+    }
+  }
+
   private static Database open() {
     return Database.open(Path.of("mem"));
   }

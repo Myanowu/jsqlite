@@ -48,8 +48,10 @@ import com.myano.jsqlite.vm.Program;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 public final class Compiler {
   private static final int CURSOR = 0;
@@ -205,9 +207,10 @@ public final class Compiler {
     List<Integer> orderRegs = prepareOrderRegisters(asm, select);
     prepareGroupRegisters(asm, select);
     Env env = envFor(table, select.alias(), sql);
-    Expr[] keys = seekKeys(table, select.where(), env);
-    if (keys != null) {
-      return compileSeek(asm, select, table, env, keys, orderRegs);
+    Access access = seekAccess(table, select.where(), env);
+    if (access != null) {
+      return compileAccess(
+          asm, select, table, env, access.columns(), access.keys(), access.primary(), orderRegs);
     }
     boolean epilogue = hasEpilogue(select);
     Scan scan = emitScan(asm, Opcode.OpenRead, table, select.where(), env, epilogue);
@@ -221,24 +224,62 @@ public final class Compiler {
     return asm.build(outputNames(select, env.sources, sql));
   }
 
-  private Program compileSeek(
-      Assembler asm, Select select, Table table, Env env, Expr[] keys, List<Integer> orderRegs) {
+  private Program compileAccess(
+      Assembler asm,
+      Select select,
+      Table table,
+      Env env,
+      int[] columns,
+      Expr[] keys,
+      boolean primary,
+      List<Integer> orderRegs) {
     int keyStart = asm.allocRange(keys.length);
     for (int i = 0; i < keys.length; i++) {
       emitExprInto(asm, keyStart + i, keys[i], env);
     }
     asm.emit(Opcode.OpenRead, CURSOR, asm.constant(table.name()), 0);
-    int seek = asm.emit(Opcode.SeekPk, CURSOR, -1, keyStart);
+    int seek;
+    int colsConst = -1;
+    if (primary) {
+      seek = asm.emit(Opcode.SeekPk, CURSOR, -1, keyStart);
+    } else {
+      colsConst = asm.constant(boxColumns(columns));
+      seek = asm.emit(Opcode.SeekIdx, CURSOR, -1, keyStart, colsConst);
+    }
+    int loop = asm.here();
+    List<Integer> fails = new ArrayList<>();
+    if (select.where() != null) {
+      List<Integer> trues = new ArrayList<>();
+      emitBool(asm, select.where(), env, trues, fails);
+      int body = asm.here();
+      for (int jump : trues) {
+        asm.patch(jump, body);
+      }
+    }
     int width = width(select, env.sources, env.sql);
     int start = asm.allocRange(width);
     writeProjection(asm, select, env, start, env.sql);
     writeGroupInto(asm, select, env);
     writeOrderInto(asm, select, env, orderRegs);
     asm.emit(Opcode.ResultRow, start, width, 0);
+    if (!primary) {
+      asm.emit(Opcode.NextIdx, CURSOR, loop, 0);
+    }
     emitEpilogue(asm);
     int halt = asm.emit(Opcode.Halt, 0, 0, 0);
     asm.patch(seek, halt);
+    for (int jump : fails) {
+      asm.patch(jump, halt);
+    }
     return asm.build(outputNames(select, env.sources, env.sql));
+  }
+
+  private static List<Integer> boxColumns(int[] columns) {
+    List<Integer> boxed = new ArrayList<>(columns.length);
+    for (int column : columns) {
+      boxed.add(column);
+    }
+    return List.copyOf(boxed);
   }
 
   private Program compileAggregate(Select select, MemoryCatalog catalog, String sql) {
@@ -326,19 +367,14 @@ public final class Compiler {
     if (isAggregate(select)) {
       return compileJoinAggregate(select, catalog, sql);
     }
-    Table root = requireTable(catalog, select.table(), sql);
-    List<Source> sources = new ArrayList<>();
-    sources.add(new Source(0, root, select.alias()));
-    for (int i = 0; i < select.joins().size(); i++) {
-      Join join = select.joins().get(i);
-      sources.add(new Source(i + 1, requireTable(catalog, join.table(), sql), join.alias()));
-    }
+    Select planned = planInnerJoins(select, catalog, sql);
+    List<Source> sources = sourcesOf(planned, catalog, sql);
     Assembler asm = new Assembler();
-    prepareLimit(asm, select, sql);
-    List<Integer> orderRegs = prepareOrderRegisters(asm, select);
-    prepareGroupRegisters(asm, select);
+    prepareLimit(asm, planned, sql);
+    List<Integer> orderRegs = prepareOrderRegisters(asm, planned);
+    prepareGroupRegisters(asm, planned);
     int zero = -1;
-    for (Join join : select.joins()) {
+    for (Join join : planned.joins()) {
       if (join.left()) {
         zero = asm.alloc();
         asm.emit(Opcode.Integer, zero, 0, 0);
@@ -346,8 +382,8 @@ public final class Compiler {
       }
     }
     Env env = new Env(sources, new boolean[sources.size()], -1, null, sql);
-    emitLevel(asm, select, env, 0, zero, orderRegs);
-    return asm.build(outputNames(select, sources, sql));
+    emitLevel(asm, planned, env, 0, zero, orderRegs);
+    return asm.build(outputNames(planned, sources, sql));
   }
 
   private Program compileJoinAggregate(Select select, MemoryCatalog catalog, String sql) {
@@ -362,19 +398,14 @@ public final class Compiler {
         throw new SqlException("column must be aggregated: " + SqlText.snippet(sql));
       }
     }
-    Table root = requireTable(catalog, select.table(), sql);
-    List<Source> sources = new ArrayList<>();
-    sources.add(new Source(0, root, select.alias()));
-    for (int i = 0; i < select.joins().size(); i++) {
-      Join join = select.joins().get(i);
-      sources.add(new Source(i + 1, requireTable(catalog, join.table(), sql), join.alias()));
-    }
+    Select planned = planInnerJoins(select, catalog, sql);
+    List<Source> sources = sourcesOf(planned, catalog, sql);
     Assembler asm = new Assembler();
-    prepareLimit(asm, select, sql);
-    int[] acc = new int[select.items().size()];
+    prepareLimit(asm, planned, sql);
+    int[] acc = new int[planned.items().size()];
     Arrays.fill(acc, -1);
-    for (int i = 0; i < select.items().size(); i++) {
-      switch (select.items().get(i)) {
+    for (int i = 0; i < planned.items().size(); i++) {
+      switch (planned.items().get(i)) {
         case CountStar ignored -> {
           acc[i] = asm.alloc();
           asm.emit(Opcode.Integer, acc[i], 0, 0);
@@ -389,7 +420,7 @@ public final class Compiler {
       }
     }
     int zero = -1;
-    for (Join join : select.joins()) {
+    for (Join join : planned.joins()) {
       if (join.left()) {
         zero = asm.alloc();
         asm.emit(Opcode.Integer, zero, 0, 0);
@@ -397,23 +428,128 @@ public final class Compiler {
       }
     }
     Env env = new Env(sources, new boolean[sources.size()], -1, null, sql);
-    emitAggregateLevel(asm, select, env, 0, zero, acc);
-    int start = asm.allocRange(select.items().size());
-    for (int i = 0; i < select.items().size(); i++) {
-      SelectItem item = select.items().get(i);
+    emitAggregateLevel(asm, planned, env, 0, zero, acc);
+    int start = asm.allocRange(planned.items().size());
+    for (int i = 0; i < planned.items().size(); i++) {
+      SelectItem item = planned.items().get(i);
       storeAggregate(asm, item, acc[i], start + i);
       if (acc[i] < 0 && item instanceof ExpressionItem expression) {
         emitExprInto(asm, start + i, expression.expr(), env);
       }
     }
-    asm.emit(Opcode.ResultRow, start, select.items().size(), 0);
+    asm.emit(Opcode.ResultRow, start, planned.items().size(), 0);
     emitEpilogue(asm);
     asm.emit(Opcode.Halt, 0, 0, 0);
     List<String> names = new ArrayList<>();
-    for (SelectItem item : select.items()) {
+    for (SelectItem item : planned.items()) {
       names.add(Labels.item(item));
     }
     return asm.build(names);
+  }
+
+  private List<Source> sourcesOf(Select select, MemoryCatalog catalog, String sql) {
+    List<Source> sources = new ArrayList<>();
+    sources.add(new Source(0, requireTable(catalog, select.table(), sql), select.alias()));
+    for (int i = 0; i < select.joins().size(); i++) {
+      Join join = select.joins().get(i);
+      sources.add(new Source(i + 1, requireTable(catalog, join.table(), sql), join.alias()));
+    }
+    return sources;
+  }
+
+  /**
+   * Flatten INNER/CROSS ON into WHERE, then put the most selective table first so later
+   * tables can SeekPk / SeekIdx instead of nested full scans. LEFT JOIN is left alone.
+   */
+  private Select planInnerJoins(Select select, MemoryCatalog catalog, String sql) {
+    if (select.joins().isEmpty()) {
+      return select;
+    }
+    for (Join join : select.joins()) {
+      if (join.left()) {
+        return select;
+      }
+    }
+    Bool where = select.where();
+    List<Join> crosses = new ArrayList<>(select.joins().size());
+    for (Join join : select.joins()) {
+      if (join.on() != null) {
+        where = combineAnd(where, join.on());
+      }
+      crosses.add(new Join(false, join.table(), join.alias(), null));
+    }
+    Select flat =
+        new Select(
+            select.distinct(),
+            select.items(),
+            select.table(),
+            select.fromSelect(),
+            select.alias(),
+            crosses,
+            where,
+            select.orderBy(),
+            select.limit(),
+            select.offset(),
+            select.groupBy());
+    return reorderCrossJoin(flat, catalog, sql);
+  }
+
+  private Select reorderCrossJoin(Select select, MemoryCatalog catalog, String sql) {
+    List<Source> sources = sourcesOf(select, catalog, sql);
+    if (sources.size() < 2 || select.where() == null || !isAndChain(select.where())) {
+      return select;
+    }
+    Env env = new Env(sources, null, -1, null, sql);
+    int[] scores = new int[sources.size()];
+    for (Predicate predicate : andPredicates(select.where())) {
+      if (!(predicate instanceof Compare compare) || compare.op() != CompareOp.EQ) {
+        continue;
+      }
+      int left = exprMaxSource(compare.left(), env);
+      int right = exprMaxSource(compare.right(), env);
+      if (left >= 0 && right < 0) {
+        scores[left]++;
+      } else if (right >= 0 && left < 0) {
+        scores[right]++;
+      }
+    }
+    int best = 0;
+    for (int i = 1; i < scores.length; i++) {
+      if (scores[i] > scores[best]) {
+        best = i;
+      } else if (scores[i] == scores[best]
+          && sources.get(i).table().rowCount() < sources.get(best).table().rowCount()) {
+        best = i;
+      }
+    }
+    if (best == 0) {
+      return select;
+    }
+    List<Source> ordered = new ArrayList<>(sources.size());
+    ordered.add(sources.get(best));
+    for (int i = 0; i < sources.size(); i++) {
+      if (i != best) {
+        ordered.add(sources.get(i));
+      }
+    }
+    Source root = ordered.get(0);
+    List<Join> joins = new ArrayList<>(ordered.size() - 1);
+    for (int i = 1; i < ordered.size(); i++) {
+      Source source = ordered.get(i);
+      joins.add(new Join(false, source.table().name(), source.alias(), null));
+    }
+    return new Select(
+        select.distinct(),
+        select.items(),
+        root.table().name(),
+        select.fromSelect(),
+        root.alias(),
+        joins,
+        select.where(),
+        select.orderBy(),
+        select.limit(),
+        select.offset(),
+        select.groupBy());
   }
 
   private void emitAggregateLevel(
@@ -735,8 +871,8 @@ public final class Compiler {
   }
 
   /**
-   * When the inner table's full primary key is bound by equality predicates from earlier
-   * sources / parameters, seek instead of scanning the cartesian product.
+   * When the inner table's primary key or secondary index is fully bound by equality
+   * predicates from earlier sources / parameters, seek instead of scanning.
    */
   private boolean emitInnerJoinSeek(
       Assembler asm,
@@ -748,21 +884,46 @@ public final class Compiler {
       int[] acc,
       Source source,
       Join join) {
-    Expr[] keys = joinSeekKeys(source, level, join.on(), select.where(), env);
-    if (keys == null) {
+    Access access = joinSeekAccess(source, level, join.on(), select.where(), env);
+    if (access == null) {
       return false;
     }
-    int keyStart = asm.allocRange(keys.length);
-    for (int i = 0; i < keys.length; i++) {
-      emitExprInto(asm, keyStart + i, keys[i], env);
+    int keyStart = asm.allocRange(access.keys().length);
+    for (int i = 0; i < access.keys().length; i++) {
+      emitExprInto(asm, keyStart + i, access.keys()[i], env);
     }
-    int miss = asm.emit(Opcode.SeekPk, source.cursor(), -1, keyStart);
+    int miss;
+    if (access.primary()) {
+      miss = asm.emit(Opcode.SeekPk, source.cursor(), -1, keyStart);
+    } else {
+      miss =
+          asm.emit(
+              Opcode.SeekIdx,
+              source.cursor(),
+              -1,
+              keyStart,
+              asm.constant(boxColumns(access.columns())));
+    }
+    int loop = asm.here();
     List<Integer> filterFails = new ArrayList<>();
     emitReadyFilters(asm, select.where(), env, level, filterFails);
+    if (join.on() != null) {
+      List<Integer> trues = new ArrayList<>();
+      List<Integer> onFails = new ArrayList<>();
+      emitJoinCondition(asm, join.on(), env, trues, onFails);
+      int matched = asm.here();
+      for (int jump : trues) {
+        asm.patch(jump, matched);
+      }
+      filterFails.addAll(onFails);
+    }
     if (acc != null) {
       emitAggregateLevel(asm, select, env, level + 1, zero, acc);
     } else {
       emitLevel(asm, select, env, level + 1, zero, orderRegs);
+    }
+    if (!access.primary()) {
+      asm.emit(Opcode.NextIdx, source.cursor(), loop, 0);
     }
     int after = asm.here();
     asm.patch(miss, after);
@@ -793,16 +954,12 @@ public final class Compiler {
     }
   }
 
-  private Expr[] joinSeekKeys(Source inner, int innerIndex, Bool on, Bool where, Env env) {
-    int[] primaryKey = inner.table().primaryKey();
-    if (primaryKey.length == 0) {
-      return null;
-    }
+  private Access joinSeekAccess(Source inner, int innerIndex, Bool on, Bool where, Env env) {
     Bool combined = combineAnd(on, where);
     if (combined == null || !isAndChain(combined)) {
       return null;
     }
-    Expr[] keys = new Expr[primaryKey.length];
+    Map<Integer, Expr> bound = new HashMap<>();
     for (Predicate predicate : andPredicates(combined)) {
       if (!(predicate instanceof Compare compare) || compare.op() != CompareOp.EQ) {
         continue;
@@ -820,24 +977,29 @@ public final class Compiler {
         continue;
       }
       int index = inner.table().columnIndex(column.name());
-      int position = -1;
-      for (int i = 0; i < primaryKey.length; i++) {
-        if (primaryKey[i] == index) {
-          position = i;
-          break;
-        }
-      }
-      if (index < 0 || position < 0 || keys[position] != null) {
+      if (index < 0 || bound.containsKey(index)) {
         continue;
       }
-      keys[position] = value;
+      bound.put(index, value);
     }
-    for (Expr key : keys) {
-      if (key == null) {
-        return null;
+    int[] primaryKey = inner.table().primaryKey();
+    Expr[] primary = bindColumns(primaryKey, bound);
+    if (primary != null) {
+      return new Access(primaryKey, primary, true);
+    }
+    for (int[] columns : inner.table().uniqueIndexColumns()) {
+      Expr[] keys = bindColumns(columns, bound);
+      if (keys != null) {
+        return new Access(columns, keys, false);
       }
     }
-    return keys;
+    for (int[] columns : inner.table().secondaryIndexColumns()) {
+      Expr[] keys = bindColumns(columns, bound);
+      if (keys != null) {
+        return new Access(columns, keys, false);
+      }
+    }
+    return null;
   }
 
   private Bool combineAnd(Bool left, Bool right) {
@@ -1272,37 +1434,80 @@ public final class Compiler {
     return columns;
   }
 
-  private Expr[] seekKeys(Table table, Bool where, Env env) {
+  /**
+   * Prefer primary key, then unique indexes, then non-unique secondary indexes. Extra AND
+   * predicates stay as residual filters after the point lookup.
+   */
+  private Access seekAccess(Table table, Bool where, Env env) {
+    if (where == null || !isAndChain(where)) {
+      return null;
+    }
+    Map<Integer, Expr> bound = equalityBindings(where, env, 0);
+    if (bound.isEmpty()) {
+      return null;
+    }
     int[] primaryKey = table.primaryKey();
-    if (primaryKey.length == 0 || where == null || !isAndChain(where)) {
-      return null;
+    Expr[] primary = bindColumns(primaryKey, bound);
+    if (primary != null) {
+      return new Access(primaryKey, primary, true);
     }
-    List<Predicate> predicates = andPredicates(where);
-    if (predicates.size() != primaryKey.length) {
-      return null;
+    for (int[] columns : table.uniqueIndexColumns()) {
+      Expr[] keys = bindColumns(columns, bound);
+      if (keys != null) {
+        return new Access(columns, keys, false);
+      }
     }
-    Expr[] keys = new Expr[primaryKey.length];
-    for (Predicate predicate : predicates) {
+    for (int[] columns : table.secondaryIndexColumns()) {
+      Expr[] keys = bindColumns(columns, bound);
+      if (keys != null) {
+        return new Access(columns, keys, false);
+      }
+    }
+    return null;
+  }
+
+  private Map<Integer, Expr> equalityBindings(Bool where, Env env, int sourceIndex) {
+    Map<Integer, Expr> bound = new HashMap<>();
+    for (Predicate predicate : andPredicates(where)) {
       if (!(predicate instanceof Compare compare) || compare.op() != CompareOp.EQ) {
+        continue;
+      }
+      ColumnRef column = null;
+      Expr value = null;
+      if (compare.left() instanceof ColumnRef left
+          && columnSource(left, env) == sourceIndex
+          && !references(compare.right())) {
+        column = left;
+        value = compare.right();
+      } else if (compare.right() instanceof ColumnRef right
+          && columnSource(right, env) == sourceIndex
+          && !references(compare.left())) {
+        column = right;
+        value = compare.left();
+      }
+      if (column == null) {
+        continue;
+      }
+      int index = env.sources.get(sourceIndex).table().columnIndex(column.name());
+      if (index < 0 || bound.containsKey(index)) {
+        continue;
+      }
+      bound.put(index, value);
+    }
+    return bound;
+  }
+
+  private static Expr[] bindColumns(int[] columns, Map<Integer, Expr> bound) {
+    if (columns.length == 0) {
+      return null;
+    }
+    Expr[] keys = new Expr[columns.length];
+    for (int i = 0; i < columns.length; i++) {
+      Expr value = bound.get(columns[i]);
+      if (value == null) {
         return null;
       }
-      if (!(compare.left() instanceof ColumnRef column) || references(compare.right())) {
-        return null;
-      }
-      if (column.table() != null && !same(column.table(), table.name())) {
-        return null;
-      }
-      int index = table.columnIndex(column.name());
-      int position = -1;
-      for (int i = 0; i < primaryKey.length; i++) {
-        if (primaryKey[i] == index) {
-          position = i;
-        }
-      }
-      if (index < 0 || position < 0 || keys[position] != null) {
-        return null;
-      }
-      keys[position] = compare.right();
+      keys[i] = value;
     }
     return keys;
   }
@@ -1472,6 +1677,8 @@ public final class Compiler {
 
   private record Scan(int rewind, int loopHead, List<Integer> fails) {}
 
+  private record Access(int[] columns, Expr[] keys, boolean primary) {}
+
   private record Source(int cursor, Table table, String alias) {}
 
   private record Resolved(int source, int cursor, int index) {}
@@ -1515,7 +1722,11 @@ public final class Compiler {
     }
 
     int emit(Opcode op, int p1, int p2, int p3) {
-      code.add(new Instruction(op, p1, p2, p3));
+      return emit(op, p1, p2, p3, 0);
+    }
+
+    int emit(Opcode op, int p1, int p2, int p3, int p4) {
+      code.add(new Instruction(op, p1, p2, p3, p4));
       return code.size() - 1;
     }
 
@@ -1525,7 +1736,9 @@ public final class Compiler {
 
     void patch(int index, int target) {
       Instruction instruction = code.get(index);
-      code.set(index, new Instruction(instruction.op(), instruction.p1(), target, instruction.p3()));
+      code.set(
+          index,
+          new Instruction(instruction.op(), instruction.p1(), target, instruction.p3(), instruction.p4()));
     }
 
     void emitNumber(int register, long value) {

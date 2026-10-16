@@ -48,6 +48,7 @@ public final class VirtualMachine {
         }
         case Rewind -> pc = rewind(cursors, instruction, pc);
         case Next -> pc = next(cursors, instruction, pc);
+        case NextIdx -> pc = nextIdx(cursors, instruction, pc);
         case Column -> {
           column(cursors, instruction, registers);
           pc++;
@@ -117,6 +118,7 @@ public final class VirtualMachine {
           pc++;
         }
         case SeekPk -> pc = seek(cursors, instruction, registers, pc);
+        case SeekIdx -> pc = seekIdx(cursors, instruction, registers, program, pc);
         case AggCount -> {
           if (instruction.p3() == 0 || registers[instruction.p2()] != null) {
             Object current = registers[instruction.p1()];
@@ -211,6 +213,8 @@ public final class VirtualMachine {
 
   private int seek(Cursor[] cursors, Instruction instruction, Object[] registers, int pc) {
     Cursor cursor = requireCursor(cursors, instruction.p1());
+    cursor.hits = null;
+    cursor.hitPos = 0;
     int length = cursor.table.primaryKey().length;
     Object[] key = new Object[length];
     for (int i = 0; i < length; i++) {
@@ -222,6 +226,60 @@ public final class VirtualMachine {
     }
     cursor.index = found;
     return pc + 1;
+  }
+
+  private int seekIdx(
+      Cursor[] cursors, Instruction instruction, Object[] registers, Program program, int pc) {
+    Cursor cursor = requireCursor(cursors, instruction.p1());
+    int[] columns = indexColumns(program, instruction.p4());
+    Object[] key = new Object[columns.length];
+    for (int i = 0; i < columns.length; i++) {
+      key[i] = cell(registers[instruction.p3() + i]);
+    }
+    int[] hits = cursor.table.seekRows(columns, key);
+    if (hits == null || hits.length == 0) {
+      cursor.hits = null;
+      cursor.hitPos = 0;
+      cursor.index = -1;
+      return instruction.p2();
+    }
+    cursor.hits = hits;
+    cursor.hitPos = 0;
+    cursor.index = hits[0];
+    return pc + 1;
+  }
+
+  private int nextIdx(Cursor[] cursors, Instruction instruction, int pc) {
+    Cursor cursor = requireCursor(cursors, instruction.p1());
+    if (cursor.hits == null) {
+      return pc + 1;
+    }
+    cursor.hitPos++;
+    if (cursor.hitPos < cursor.hits.length) {
+      cursor.index = cursor.hits[cursor.hitPos];
+      return instruction.p2();
+    }
+    cursor.hits = null;
+    cursor.hitPos = 0;
+    cursor.index = -1;
+    return pc + 1;
+  }
+
+  @SuppressWarnings("unchecked")
+  private static int[] indexColumns(Program program, int constantIndex) {
+    Object constant = program.constant(constantIndex);
+    if (!(constant instanceof List<?> list) || list.isEmpty()) {
+      throw new IllegalStateException("SeekIdx needs column list constant");
+    }
+    int[] columns = new int[list.size()];
+    for (int i = 0; i < list.size(); i++) {
+      Object value = list.get(i);
+      if (!(value instanceof Integer column)) {
+        throw new IllegalStateException("SeekIdx column list must be integers");
+      }
+      columns[i] = column;
+    }
+    return columns;
   }
 
   private int insert(
@@ -602,6 +660,8 @@ public final class VirtualMachine {
   private static final class Cursor {
     private final Table table;
     private int index = -1;
+    private int[] hits;
+    private int hitPos;
 
     private Cursor(Table table) {
       this.table = table;

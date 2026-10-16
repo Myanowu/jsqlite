@@ -22,10 +22,12 @@ public final class Table {
   private String sql;
   private final List<Column> columns = new ArrayList<>();
   private final List<UniqueKey> uniqueKeys = new ArrayList<>();
+  private final List<IndexMap> indexMaps = new ArrayList<>();
   private final List<ForeignKeyConstraint> foreignKeys = new ArrayList<>();
   private final List<Object[]> rows = new ArrayList<>();
   /** Compact primary-key tuple → row index. SeekPk must be O(1), not a table scan. */
   private final Map<Object, Integer> primaryIndex = new HashMap<>();
+  private static final int[] EMPTY_ROWS = new int[0];
   private int[] primaryKey = new int[0];
   private int integerPkIndex = -1;
   private long nextId = 1;
@@ -56,7 +58,7 @@ public final class Table {
         }
       }
       rows.add(checked);
-      indexPrimary(checked, rows.size() - 1);
+      indexRow(checked, rows.size() - 1);
       noteIdentity(checked);
     }
   }
@@ -80,6 +82,7 @@ public final class Table {
     primaryIndex.clear();
     validate(constraints, sql);
     uniqueKeys.clear();
+    indexMaps.clear();
     foreignKeys.clear();
     if (primaryKey.length > 0) {
       uniqueKeys.add(new UniqueKey(primaryKey.clone(), -1));
@@ -88,11 +91,16 @@ public final class Table {
       Column column = columns.get(i);
       if (column.unique() && !column.primaryKey()) {
         uniqueKeys.add(new UniqueKey(new int[] {i}, -1));
+        indexMaps.add(new IndexMap(new int[] {i}, -1, true));
       }
     }
     for (TableConstraint constraint : constraints) {
       if (constraint instanceof UniqueConstraint unique) {
-        uniqueKeys.add(new UniqueKey(indexes(unique.columns(), sql), -1));
+        int[] cols = indexes(unique.columns(), sql);
+        uniqueKeys.add(new UniqueKey(cols, -1));
+        if (!sameSet(cols, primaryKey)) {
+          indexMaps.add(new IndexMap(cols.clone(), -1, true));
+        }
       }
       if (constraint instanceof ForeignKeyConstraint foreignKey) {
         indexes(List.of(foreignKey.column()), sql);
@@ -176,12 +184,71 @@ public final class Table {
     if (primaryKey.length == 0 || primaryKey.length != key.length) {
       return -1;
     }
-    Object mapKey = compactPrimaryKey(key);
+    Object mapKey = compactKey(key);
     if (mapKey == null) {
       return -1;
     }
     Integer row = primaryIndex.get(mapKey);
     return row == null ? -1 : row;
+  }
+
+  /** Rows matching a secondary (or unique non-PK) index. Empty when nothing matches. */
+  public int[] seekRows(int[] columns, Object[] key) {
+    if (primaryKey.length > 0 && sameSet(columns, primaryKey)) {
+      int row = seek(key);
+      return row < 0 ? EMPTY_ROWS : new int[] {row};
+    }
+    IndexMap map = findIndexMap(columns);
+    if (map == null) {
+      return null;
+    }
+    Object mapKey = compactKey(key);
+    if (mapKey == null) {
+      return EMPTY_ROWS;
+    }
+    if (map.unique) {
+      Integer row = map.uniqueRows.get(mapKey);
+      return row == null ? EMPTY_ROWS : new int[] {row};
+    }
+    ArrayList<Integer> hits = map.multiRows.get(mapKey);
+    if (hits == null || hits.isEmpty()) {
+      return EMPTY_ROWS;
+    }
+    int[] rows = new int[hits.size()];
+    for (int i = 0; i < hits.size(); i++) {
+      rows[i] = hits.get(i);
+    }
+    return rows;
+  }
+
+  public boolean isUniqueIndex(int[] columns) {
+    if (primaryKey.length > 0 && sameSet(columns, primaryKey)) {
+      return true;
+    }
+    IndexMap map = findIndexMap(columns);
+    return map != null && map.unique;
+  }
+
+  /** Unique secondary indexes (not the primary key). */
+  public List<int[]> uniqueIndexColumns() {
+    List<int[]> list = new ArrayList<>();
+    for (IndexMap map : indexMaps) {
+      if (map.unique) {
+        list.add(map.columns.clone());
+      }
+    }
+    return list;
+  }
+
+  /** Non-unique secondary indexes. */
+  public List<int[]> secondaryIndexColumns() {
+    List<int[]> list = new ArrayList<>();
+    for (IndexMap map : indexMaps) {
+      if (!map.unique) {
+        list.add(map.columns.clone());
+      }
+    }
+    return list;
   }
 
   public Place place(Object[] raw, InsertMode mode, int[] conflictTarget) {
@@ -213,7 +280,7 @@ public final class Table {
     }
     assignIdentity(row);
     rows.add(row);
-    indexPrimary(row, rows.size() - 1);
+    indexRow(row, rows.size() - 1);
     return Place.INSERTED;
   }
 
@@ -237,14 +304,14 @@ public final class Table {
       }
     }
     noteIdentity(checked);
-    unindexPrimary(rows.get(row));
+    unindexRow(rows.get(row), row);
     rows.set(row, checked);
-    indexPrimary(checked, row);
+    indexRow(checked, row);
   }
 
   public void remove(int row) {
     rows.remove(row);
-    rebuildPrimaryIndex();
+    rebuildAllIndexes();
   }
 
   int findRow(Object[] values) {
@@ -289,6 +356,21 @@ public final class Table {
 
   void addUnique(int[] keyColumns, int partialColumn) {
     uniqueKeys.add(new UniqueKey(keyColumns.clone(), partialColumn));
+    if (!sameSet(keyColumns, primaryKey)) {
+      IndexMap map = new IndexMap(keyColumns.clone(), partialColumn, true);
+      indexMaps.add(map);
+      for (int i = 0; i < rows.size(); i++) {
+        indexOne(map, rows.get(i), i);
+      }
+    }
+  }
+
+  void addNonUniqueIndex(int[] keyColumns, int partialColumn) {
+    IndexMap map = new IndexMap(keyColumns.clone(), partialColumn, false);
+    indexMaps.add(map);
+    for (int i = 0; i < rows.size(); i++) {
+      indexOne(map, rows.get(i), i);
+    }
   }
 
   State capture() {
@@ -300,6 +382,10 @@ public final class Table {
     for (UniqueKey key : uniqueKeys) {
       keys.add(new UniqueKey(key.columns.clone(), key.partial));
     }
+    List<IndexSpec> specs = new ArrayList<>(indexMaps.size());
+    for (IndexMap map : indexMaps) {
+      specs.add(new IndexSpec(map.columns.clone(), map.partial, map.unique));
+    }
     return new State(
         name,
         sql,
@@ -309,6 +395,7 @@ public final class Table {
         copy,
         nextId,
         keys,
+        specs,
         List.copyOf(foreignKeys));
   }
 
@@ -327,7 +414,11 @@ public final class Table {
     foreignKeys.clear();
     foreignKeys.addAll(state.foreignKeys);
     pendingConflict = -1;
-    rebuildPrimaryIndex();
+    indexMaps.clear();
+    for (IndexSpec spec : state.indexSpecs) {
+      indexMaps.add(new IndexMap(spec.columns.clone(), spec.partial, spec.unique));
+    }
+    rebuildAllIndexes();
   }
 
   private void validate(List<TableConstraint> constraints, String sql) {
@@ -496,11 +587,23 @@ public final class Table {
       }
     }
     if (primaryKey.length > 0 && sameSet(key, primaryKey)) {
-      Object mapKey = primaryKeyOfRow(row);
+      Object mapKey = keyOfRow(row, primaryKey);
       if (mapKey == null) {
         return -1;
       }
       Integer hit = primaryIndex.get(mapKey);
+      if (hit == null || hit == ignore) {
+        return -1;
+      }
+      return hit;
+    }
+    IndexMap map = findIndexMap(key);
+    if (map != null && map.unique) {
+      Object mapKey = keyOfRow(row, map.columns);
+      if (mapKey == null) {
+        return -1;
+      }
+      Integer hit = map.uniqueRows.get(mapKey);
       if (hit == null || hit == ignore) {
         return -1;
       }
@@ -517,40 +620,95 @@ public final class Table {
     return -1;
   }
 
-  private void rebuildPrimaryIndex() {
+  private void rebuildAllIndexes() {
     primaryIndex.clear();
-    if (primaryKey.length == 0) {
-      return;
+    for (IndexMap map : indexMaps) {
+      map.uniqueRows.clear();
+      map.multiRows.clear();
     }
     for (int i = 0; i < rows.size(); i++) {
-      indexPrimary(rows.get(i), i);
+      indexRow(rows.get(i), i);
     }
   }
 
-  private void indexPrimary(Object[] row, int index) {
-    Object mapKey = primaryKeyOfRow(row);
+  private void indexRow(Object[] row, int index) {
+    Object mapKey = keyOfRow(row, primaryKey);
     if (mapKey != null) {
       primaryIndex.put(mapKey, index);
     }
+    for (IndexMap map : indexMaps) {
+      indexOne(map, row, index);
+    }
   }
 
-  private void unindexPrimary(Object[] row) {
-    Object mapKey = primaryKeyOfRow(row);
+  private void unindexRow(Object[] row, int index) {
+    Object mapKey = keyOfRow(row, primaryKey);
     if (mapKey != null) {
       primaryIndex.remove(mapKey);
     }
+    for (IndexMap map : indexMaps) {
+      if (skips(map, row)) {
+        continue;
+      }
+      Object key = keyOfRow(row, map.columns);
+      if (key == null) {
+        continue;
+      }
+      if (map.unique) {
+        Integer hit = map.uniqueRows.get(key);
+        if (hit != null && hit == index) {
+          map.uniqueRows.remove(key);
+        }
+      } else {
+        ArrayList<Integer> hits = map.multiRows.get(key);
+        if (hits != null) {
+          hits.remove((Integer) index);
+          if (hits.isEmpty()) {
+            map.multiRows.remove(key);
+          }
+        }
+      }
+    }
   }
 
-  private Object primaryKeyOfRow(Object[] row) {
-    if (primaryKey.length == 0) {
+  private void indexOne(IndexMap map, Object[] row, int index) {
+    if (skips(map, row)) {
+      return;
+    }
+    Object key = keyOfRow(row, map.columns);
+    if (key == null) {
+      return;
+    }
+    if (map.unique) {
+      map.uniqueRows.put(key, index);
+    } else {
+      map.multiRows.computeIfAbsent(key, ignored -> new ArrayList<>()).add(index);
+    }
+  }
+
+  private IndexMap findIndexMap(int[] columns) {
+    for (IndexMap map : indexMaps) {
+      if (sameSet(map.columns, columns)) {
+        return map;
+      }
+    }
+    return null;
+  }
+
+  private boolean skips(IndexMap map, Object[] row) {
+    return map.partial >= 0 && row[map.partial] == null;
+  }
+
+  private Object keyOfRow(Object[] row, int[] columns) {
+    if (columns.length == 0) {
       return null;
     }
-    if (primaryKey.length == 1) {
-      return row[primaryKey[0]];
+    if (columns.length == 1) {
+      return row[columns[0]];
     }
-    Object[] parts = new Object[primaryKey.length];
-    for (int i = 0; i < primaryKey.length; i++) {
-      Object part = row[primaryKey[i]];
+    Object[] parts = new Object[columns.length];
+    for (int i = 0; i < columns.length; i++) {
+      Object part = row[columns[i]];
       if (part == null) {
         return null;
       }
@@ -559,8 +717,8 @@ public final class Table {
     return List.copyOf(Arrays.asList(parts));
   }
 
-  /** {@code key} is already in primary-key column order (SeekPk register order). */
-  private Object compactPrimaryKey(Object[] key) {
+  /** Key values already in index column order. */
+  private Object compactKey(Object[] key) {
     for (Object part : key) {
       if (part == null) {
         return null;
@@ -600,6 +758,22 @@ public final class Table {
 
   private record UniqueKey(int[] columns, int partial) {}
 
+  private record IndexSpec(int[] columns, int partial, boolean unique) {}
+
+  private static final class IndexMap {
+    private final int[] columns;
+    private final int partial;
+    private final boolean unique;
+    private final Map<Object, Integer> uniqueRows = new HashMap<>();
+    private final Map<Object, ArrayList<Integer>> multiRows = new HashMap<>();
+
+    private IndexMap(int[] columns, int partial, boolean unique) {
+      this.columns = columns;
+      this.partial = partial;
+      this.unique = unique;
+    }
+  }
+
   static final class State {
     private final String name;
     private final String sql;
@@ -609,6 +783,7 @@ public final class Table {
     private final List<Object[]> rows;
     private final long nextId;
     private final List<UniqueKey> keys;
+    private final List<IndexSpec> indexSpecs;
     private final List<ForeignKeyConstraint> foreignKeys;
 
     private State(
@@ -620,6 +795,7 @@ public final class Table {
         List<Object[]> rows,
         long nextId,
         List<UniqueKey> keys,
+        List<IndexSpec> indexSpecs,
         List<ForeignKeyConstraint> foreignKeys) {
       this.name = name;
       this.sql = sql;
@@ -629,6 +805,7 @@ public final class Table {
       this.rows = rows;
       this.nextId = nextId;
       this.keys = keys;
+      this.indexSpecs = indexSpecs;
       this.foreignKeys = foreignKeys;
     }
   }
