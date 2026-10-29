@@ -38,14 +38,15 @@ class CompilerTest {
 
   @Test
   void selectJumpsIntoTheBodyOnlyWhenTheComparisonHolds() {
-    Program program = compile("CREATE TABLE t (id INTEGER)", "SELECT id FROM t WHERE id = 1");
+    // Inequality is not seekable — keep the Rewind + Eq residual filter plan.
+    Program program = compile("CREATE TABLE t (id INTEGER)", "SELECT id FROM t WHERE id > 1");
     assertEquals(
         List.of(
             Opcode.OpenRead,
             Opcode.Rewind,
             Opcode.Column,
             Opcode.Integer,
-            Opcode.Eq,
+            Opcode.Gt,
             Opcode.Next,
             Opcode.Halt,
             Opcode.Column,
@@ -56,6 +57,18 @@ class CompilerTest {
     assertEquals(program.instructionCount() - 1, program.instruction(1).p2());
     assertEquals(7, program.instruction(4).p2());
     assertFalse(program.opcodes().contains(Opcode.Rowid));
+  }
+
+  @Test
+  void equalityWhereUsesAutoSeekIdx() {
+    // Two equalities are enough for auto-seek (e.g. Company+GroupID).
+    Program program =
+        compile(
+            "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER)",
+            "SELECT a FROM t WHERE a = 1 AND b = 2");
+    assertTrue(program.opcodes().contains(Opcode.SeekIdx));
+    assertTrue(program.opcodes().contains(Opcode.NextIdx));
+    assertFalse(program.opcodes().contains(Opcode.Rewind));
   }
 
   @Test

@@ -11,8 +11,10 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -29,6 +31,7 @@ public final class VirtualMachine {
     List<Row> results = new ArrayList<>();
     List<KeyedRow> buffered = new ArrayList<>();
     Map<GroupKey, KeyedRow> grouped = new LinkedHashMap<>();
+    GroupAgg agg = new GroupAgg();
     int pc = 0;
     for (int step = 0; step < STEP_LIMIT; step++) {
       if (pc < 0 || pc >= program.instructionCount()) {
@@ -104,6 +107,31 @@ public final class VirtualMachine {
           registers[instruction.p3()] = value == null ? registers[instruction.p2()] : value;
           pc++;
         }
+        case Cast -> {
+          Object spec = program.constant(instruction.p3());
+          if (!(spec instanceof CastSpec cast)) {
+            throw new IllegalStateException("CAST type is missing");
+          }
+          registers[instruction.p1()] = castValue(registers[instruction.p2()], cast);
+          pc++;
+        }
+        case Abs -> {
+          registers[instruction.p1()] = absValue(registers[instruction.p2()]);
+          pc++;
+        }
+        case GroupTemplate -> {
+          agg.reset(registers, registerList(program, instruction.p2()));
+          pc++;
+        }
+        case GroupLoad -> {
+          agg.load(program, registers);
+          pc++;
+        }
+        case GroupStore -> {
+          agg.store(program, registers);
+          pc++;
+        }
+        case GroupNext -> pc = agg.next(program, registers) ? pc + 1 : instruction.p2();
         case MakeRecord -> {
           registers[instruction.p3()] = makeRecord(registers, instruction);
           pc++;
@@ -129,6 +157,10 @@ public final class VirtualMachine {
         }
         case AggMax -> {
           accumulateMax(registers, instruction);
+          pc++;
+        }
+        case AggSum -> {
+          accumulateSum(registers, instruction);
           pc++;
         }
         case AggCountDistinct -> {
@@ -426,6 +458,31 @@ public final class VirtualMachine {
     }
   }
 
+  private void accumulateSum(Object[] registers, Instruction instruction) {
+    Object value = registers[instruction.p2()];
+    if (value == null) {
+      return;
+    }
+    Double addend = number(value);
+    if (addend == null) {
+      return;
+    }
+    Object current = registers[instruction.p1()];
+    if (current == null) {
+      registers[instruction.p1()] = value instanceof Long ? value : addend;
+      return;
+    }
+    if (current instanceof Long left && value instanceof Long right) {
+      registers[instruction.p1()] = left + right;
+      return;
+    }
+    Double base = number(current);
+    if (base == null) {
+      return;
+    }
+    registers[instruction.p1()] = base + addend;
+  }
+
   private Row resultRow(Program program, Instruction instruction, Object[] registers) {
     int start = instruction.p1();
     int count = instruction.p2();
@@ -478,6 +535,136 @@ public final class VirtualMachine {
       return null;
     }
     return text(left) + text(right);
+  }
+
+  private static Object absValue(Object value) {
+    if (value == null) {
+      return null;
+    }
+    if (value instanceof Boolean bit) {
+      return bit ? 1L : 0L;
+    }
+    if (value instanceof Long number) {
+      if (number == Long.MIN_VALUE) {
+        throw new SqlException("ABS overflow");
+      }
+      return number < 0 ? -number : number;
+    }
+    if (value instanceof Double number) {
+      return Math.abs(number);
+    }
+    if (value instanceof String text) {
+      double number = Double.parseDouble(text.trim());
+      if (number == Math.rint(number)) {
+        return (long) Math.abs(number);
+      }
+      return Math.abs(number);
+    }
+    throw new SqlException("cannot take ABS of " + value);
+  }
+
+  private static int[] registerList(Program program, int constant) {
+    Object value = program.constant(constant);
+    if (!(value instanceof List<?> list)) {
+      throw new IllegalStateException("group accumulator list is missing");
+    }
+    int[] registers = new int[list.size()];
+    for (int i = 0; i < registers.length; i++) {
+      registers[i] = (Integer) list.get(i);
+    }
+    return registers;
+  }
+
+  private static Object castValue(Object value, CastSpec spec) {
+    if (value == null) {
+      return null;
+    }
+    String type = spec.type().toLowerCase(Locale.ROOT);
+    return switch (type) {
+      case "bit" -> castBit(value);
+      case "nvarchar", "varchar", "nchar", "char", "text", "ntext", "sysname" ->
+          castText(value, spec.length());
+      case "int", "integer", "bigint", "smallint", "tinyint" -> castInt(value);
+      case "decimal", "numeric", "float", "real", "money", "smallmoney" ->
+          castReal(value, spec.scale());
+      case "datetime", "datetime2", "smalldatetime", "date", "time", "datetimeoffset" ->
+          castText(value, -1);
+      default -> throw new SqlException("unsupported CAST type " + spec.type());
+    };
+  }
+
+  private static Object castBit(Object value) {
+    if (value instanceof Boolean bit) {
+      return bit ? 1L : 0L;
+    }
+    if (value instanceof Number number) {
+      return number.doubleValue() == 0 ? 0L : 1L;
+    }
+    if (value instanceof String text) {
+      String trimmed = text.trim();
+      if (trimmed.equals("1") || trimmed.equalsIgnoreCase("true")) {
+        return 1L;
+      }
+      if (trimmed.equals("0") || trimmed.equalsIgnoreCase("false")) {
+        return 0L;
+      }
+    }
+    throw new SqlException("cannot cast " + value + " to bit");
+  }
+
+  private static Object castText(Object value, int length) {
+    String text;
+    if (value instanceof String string) {
+      text = string;
+    } else if (value instanceof byte[] bytes) {
+      text = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+    } else if (value instanceof Double number && number == Math.rint(number)) {
+      text = Long.toString(number.longValue());
+    } else {
+      text = String.valueOf(value);
+    }
+    if (length >= 0 && text.length() > length) {
+      return text.substring(0, length);
+    }
+    return text;
+  }
+
+  private static long castInt(Object value) {
+    if (value instanceof Boolean bit) {
+      return bit ? 1L : 0L;
+    }
+    if (value instanceof Number number) {
+      return (long) number.doubleValue();
+    }
+    if (value instanceof String text) {
+      String trimmed = text.trim();
+      if (trimmed.isEmpty()) {
+        throw new SqlException("cannot cast '' to int");
+      }
+      return (long) Double.parseDouble(trimmed);
+    }
+    throw new SqlException("cannot cast " + value + " to int");
+  }
+
+  private static Object castReal(Object value, int scale) {
+    double number;
+    if (value instanceof Boolean bit) {
+      number = bit ? 1 : 0;
+    } else if (value instanceof Number numeric) {
+      number = numeric.doubleValue();
+    } else if (value instanceof String text) {
+      number = Double.parseDouble(text.trim());
+    } else {
+      throw new SqlException("cannot cast " + value + " to a number");
+    }
+    if (scale >= 0) {
+      double factor = Math.pow(10, scale);
+      number = Math.round(number * factor) / factor;
+    }
+    if (scale <= 0 && number == Math.rint(number)) {
+      return (long) number;
+    }
+    return number;
   }
 
   private String text(Object value) {
@@ -669,6 +856,71 @@ public final class VirtualMachine {
   }
 
   private record KeyedRow(Row row, Object[] keys) {}
+
+  private static final class GroupAgg {
+    private int[] registers = new int[0];
+    private Object[] template = new Object[0];
+    private final Map<GroupKey, Object[]> saved = new LinkedHashMap<>();
+    private Iterator<Map.Entry<GroupKey, Object[]>> cursor;
+    private boolean started;
+
+    private void reset(Object[] live, int[] aggregateRegisters) {
+      registers = aggregateRegisters;
+      template = copy(live, aggregateRegisters);
+      saved.clear();
+      cursor = null;
+      started = false;
+    }
+
+    private void load(Program program, Object[] live) {
+      Object[] values = saved.get(key(program, live));
+      paste(live, registers, values == null ? template : values);
+    }
+
+    private void store(Program program, Object[] live) {
+      saved.put(key(program, live), copy(live, registers));
+    }
+
+    private boolean next(Program program, Object[] live) {
+      if (!started) {
+        cursor = saved.entrySet().iterator();
+        started = true;
+      }
+      if (cursor == null || !cursor.hasNext()) {
+        return false;
+      }
+      Map.Entry<GroupKey, Object[]> entry = cursor.next();
+      int[] groups = program.groupRegisters();
+      for (int i = 0; i < groups.length; i++) {
+        live[groups[i]] = entry.getKey().parts[i];
+      }
+      paste(live, registers, entry.getValue());
+      return true;
+    }
+
+    private static GroupKey key(Program program, Object[] live) {
+      int[] groups = program.groupRegisters();
+      Object[] parts = new Object[groups.length];
+      for (int i = 0; i < parts.length; i++) {
+        parts[i] = live[groups[i]];
+      }
+      return new GroupKey(parts);
+    }
+
+    private static Object[] copy(Object[] live, int[] indexes) {
+      Object[] values = new Object[indexes.length];
+      for (int i = 0; i < indexes.length; i++) {
+        values[i] = live[indexes[i]];
+      }
+      return values;
+    }
+
+    private static void paste(Object[] live, int[] indexes, Object[] values) {
+      for (int i = 0; i < indexes.length; i++) {
+        live[indexes[i]] = values[i];
+      }
+    }
+  }
 
   private static final class GroupKey {
     private final Object[] parts;

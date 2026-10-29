@@ -3,12 +3,15 @@ package com.myano.jsqlite.sql;
 import com.myano.jsqlite.sql.Ast.AlterTable;
 import com.myano.jsqlite.sql.Ast.Assign;
 import com.myano.jsqlite.sql.Ast.Bool;
+import com.myano.jsqlite.sql.Ast.CaseArm;
+import com.myano.jsqlite.sql.Ast.CaseExpr;
 import com.myano.jsqlite.sql.Ast.ColumnRef;
 import com.myano.jsqlite.sql.Ast.Compare;
 import com.myano.jsqlite.sql.Ast.Concat;
 import com.myano.jsqlite.sql.Ast.CreateIndex;
 import com.myano.jsqlite.sql.Ast.CreateTable;
 import com.myano.jsqlite.sql.Ast.Delete;
+import com.myano.jsqlite.sql.Ast.Exists;
 import com.myano.jsqlite.sql.Ast.Expr;
 import com.myano.jsqlite.sql.Ast.ExpressionItem;
 import com.myano.jsqlite.sql.Ast.IfNullExpr;
@@ -23,6 +26,7 @@ import com.myano.jsqlite.sql.Ast.OrderItem;
 import com.myano.jsqlite.sql.Ast.Parameter;
 import com.myano.jsqlite.sql.Ast.Pragma;
 import com.myano.jsqlite.sql.Ast.Pred;
+import com.myano.jsqlite.sql.Ast.ScalarSubquery;
 import com.myano.jsqlite.sql.Ast.Select;
 import com.myano.jsqlite.sql.Ast.SelectItem;
 import com.myano.jsqlite.sql.Ast.Statement;
@@ -40,6 +44,7 @@ public final class Parameters {
       case Ast.Shutdown ignored -> 0;
       case Insert insert -> countInsert(insert);
       case Select select -> countSelect(select);
+      case Ast.Compound compound -> countCompound(compound);
       case Update update -> countUpdate(update);
       case Delete delete -> countBool(delete.where());
       case Pragma ignored -> 0;
@@ -73,6 +78,7 @@ public final class Parameters {
       count += countBool(join.on());
     }
     count += countBool(select.where());
+    count += countBool(select.having());
     for (OrderItem item : select.orderBy()) {
       count += countExpr(item.expr());
     }
@@ -102,6 +108,7 @@ public final class Parameters {
         case IsNull isNull -> countExpr(isNull.expr());
         case Like like -> countExpr(like.left()) + countExpr(like.right());
         case InSubquery in -> countExpr(in.left()) + countSelect(in.query());
+        case Exists exists -> countSelect(exists.query());
       };
     };
   }
@@ -117,6 +124,28 @@ public final class Parameters {
       case Now ignored -> 0;
       case Concat concat -> countExpr(concat.left()) + countExpr(concat.right());
       case IfNullExpr ifNull -> countExpr(ifNull.value()) + countExpr(ifNull.fallback());
+      case CaseExpr cse -> {
+        int n = countExpr(cse.operand()) + countExpr(cse.elseExpr());
+        for (CaseArm arm : cse.arms()) {
+          n += countBool(arm.whenCond()) + countExpr(arm.whenValue()) + countExpr(arm.thenExpr());
+        }
+        yield n;
+      }
+      case ScalarSubquery sub -> countSelect(sub.query());
+      case Ast.SumExpr sum -> countExpr(sum.expr());
+      case Ast.CastExpr cast -> countExpr(cast.value());
+      case Ast.AbsExpr abs -> countExpr(abs.value());
     };
+  }
+
+  private static int countCompound(Ast.Compound compound) {
+    int count = 0;
+    for (Select arm : compound.arms()) {
+      count += countSelect(arm);
+    }
+    for (OrderItem item : compound.orderBy()) {
+      count += countExpr(item.expr());
+    }
+    return count + countExpr(compound.limit()) + countExpr(compound.offset());
   }
 }

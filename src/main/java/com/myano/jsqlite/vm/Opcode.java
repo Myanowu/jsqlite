@@ -78,6 +78,8 @@ public enum Opcode {
   AggCount,
   /** 用 r[p2] 更新最大值 r[p1]。null 不参与。 */
   AggMax,
+  /** 用 r[p2] 累加到 r[p1]。null 不参与；全 null 时结果仍为 null。 */
+  AggSum,
   /** 按程序里的排序键重排已经产出的行。 */
   Sort,
   /** 用程序里的 LIMIT / OFFSET 寄存器截断结果。 */
@@ -87,5 +89,17 @@ public enum Opcode {
   /** r[p1] 这个集合加入 r[p2]。null 不计。 */
   AggCountDistinct,
   /** r[p3] = r[p1] 集合的元素个数。空集合是 0。 */
-  AggCard
+  AggCard,
+  /** r[p1] = CAST(r[p2] AS 常量池 p3 的 {@link CastSpec})。 */
+  Cast,
+  /** r[p1] = ABS(r[p2])。null 仍是 null。 */
+  Abs,
+  /** p2 = 常量池里的聚合寄存器下标。把这些寄存器的当前值记成每个分组的初始值。 */
+  GroupTemplate,
+  /** 按当前分组键装入该组的聚合寄存器；新分组用初始值。 */
+  GroupLoad,
+  /** 把聚合寄存器写回当前分组。 */
+  GroupStore,
+  /** 装入下一组的键和聚合寄存器。没有下一组则跳到 p2。 */
+  GroupNext
 }

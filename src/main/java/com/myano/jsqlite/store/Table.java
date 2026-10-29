@@ -27,15 +27,222 @@ public final class Table {
   private final List<Object[]> rows = new ArrayList<>();
   /** Compact primary-key tuple → row index. SeekPk must be O(1), not a table scan. */
   private final Map<Object, Integer> primaryIndex = new HashMap<>();
+  /** Lowercase column name → ordinal. Avoid O(cols) + toLowerCase on every lookup. */
+  private final Map<String, Integer> columnByLower = new HashMap<>();
   private static final int[] EMPTY_ROWS = new int[0];
   private int[] primaryKey = new int[0];
   private int integerPkIndex = -1;
   private long nextId = 1;
   private int pendingConflict = -1;
+  /** Loads row data on first access so opening a large file does not fill the heap. */
+  private Runnable deferredLoad;
+  /** Disk-backed rows (preferred for large deferred tables — no Object[] materialization). */
+  private FileBackedRows fileRows;
+  /** Original btree root in the source file; used to copy pages on persist without materializing. */
+  private int sourceRootPage;
+  private boolean mutated;
+  private boolean loading;
+  /** When set, row data lives in a sibling sidecar file; main persist writes an empty leaf. */
+  private java.nio.file.Path sidecarPath;
+  /** Directory for {@link RatioAutoIndex} meta files; set by Engine on open. */
+  private java.nio.file.Path ratioMetaDir;
+  private boolean ratioAnalyzed;
+  /** Column names that passed ratio thresholds (may not be populated as IndexMap yet). */
+  private final java.util.LinkedHashSet<String> ratioWinners = new java.util.LinkedHashSet<>();
 
   Table(String name, List<Column> columns, List<TableConstraint> constraints, String sql) {
     install(name, columns, constraints, sql);
   }
+
+  public void deferLoad(int rootPage, Runnable loader) {
+    this.sourceRootPage = rootPage;
+    this.deferredLoad = loader;
+    this.fileRows = null;
+    this.mutated = false;
+    resetLazyIndexes();
+  }
+
+  public void deferLoad(Runnable loader) {
+    deferLoad(0, loader);
+  }
+
+  /** Prefer file-backed reads: builds a cell-offset index, never loads all rows as objects. */
+  public void attachFile(
+      com.myano.jsqlite.format.DbImage file,
+      int pageSize,
+      int reserved,
+      int rootPage) {
+    this.sourceRootPage = rootPage;
+    this.deferredLoad = null;
+    this.fileRows =
+        new FileBackedRows(file, pageSize, reserved, rootPage, columns, name, integerPkIndex);
+    this.mutated = false;
+    this.ratioAnalyzed = false;
+    this.ratioWinners.clear();
+    resetLazyIndexes();
+  }
+
+  public void setRatioMetaDir(java.nio.file.Path dir) {
+    this.ratioMetaDir = dir;
+  }
+
+  public java.nio.file.Path ratioMetaDir() {
+    return ratioMetaDir;
+  }
+
+  public boolean ratioAnalyzed() {
+    return ratioAnalyzed;
+  }
+
+  public void markRatioAnalyzed() {
+    this.ratioAnalyzed = true;
+  }
+
+  /** Allow {@code PRAGMA jsqlite_analyze} to rebuild ratio indexes. */
+  public void resetRatioAnalyzed() {
+    this.ratioAnalyzed = false;
+    ratioWinners.clear();
+  }
+
+  public void setRatioWinners(java.util.Collection<String> names) {
+    ratioWinners.clear();
+    if (names != null) {
+      ratioWinners.addAll(names);
+    }
+  }
+
+  public boolean isRatioWinner(int column) {
+    if (column < 0 || column >= columns.size()) {
+      return false;
+    }
+    return ratioWinners.contains(columns.get(column).name());
+  }
+
+  /**
+   * Shared row view for indexing passes — valid until the next row access when file-backed. Callers
+   * must not retain or mutate the array.
+   */
+  public Object[] peekRow(int row) {
+    if (fileRows != null && !mutated) {
+      return fileRows.peekRow(row);
+    }
+    ensureLoaded();
+    return rows.get(row);
+  }
+
+  /** Install a pre-built non-unique posting list for one column (ratio auto-index). */
+  public void installRatioPosting(int column, java.util.Map<Object, ArrayList<Integer>> posting) {
+    if (column < 0 || column >= columns.size() || posting == null || posting.isEmpty()) {
+      return;
+    }
+    int[] cols = {column};
+    if (findIndexMap(cols) != null) {
+      return;
+    }
+    IndexMap map = new IndexMap(cols, -1, false);
+    map.multiRows.putAll(posting);
+    map.populated = true;
+    indexMaps.add(map);
+  }
+
+  /** Mark this table as living in a sibling sidecar file (keeps path across mutations for rewrite). */
+  public void bindSidecar(java.nio.file.Path path) {
+    this.sidecarPath = path;
+  }
+
+  public java.nio.file.Path sidecarPath() {
+    return sidecarPath;
+  }
+
+  public boolean isSidecar() {
+    return sidecarPath != null;
+  }
+
+  public boolean isMutated() {
+    return mutated;
+  }
+
+  private void resetLazyIndexes() {
+    primaryIndex.clear();
+    primaryIndexBuilt = false;
+    for (IndexMap map : indexMaps) {
+      map.uniqueRows.clear();
+      map.multiRows.clear();
+      map.populated = false;
+    }
+  }
+
+  public boolean hasDeferredLoad() {
+    return deferredLoad != null || (fileRows != null && rows.isEmpty() && !mutated);
+  }
+
+  /** Unmodified deferred/source table: persist can copy btree pages from the file image. */
+  public int sourceRootPage() {
+    return !mutated && sourceRootPage > 0 ? sourceRootPage : 0;
+  }
+
+  private void markMutated() {
+    if (loading) {
+      return;
+    }
+    mutated = true;
+    sourceRootPage = 0;
+    fileRows = null;
+  }
+
+  /**
+   * Deferred loader only. File-backed tables stay on disk for reads — call {@link
+   * #materializeForWrite()} before mutating.
+   */
+  private void ensureLoaded() {
+    Runnable loader = deferredLoad;
+    if (loader == null) {
+      return;
+    }
+    deferredLoad = null;
+    loading = true;
+    try {
+      loader.run();
+    } finally {
+      loading = false;
+    }
+  }
+
+  /** Pull file-backed / deferred rows into {@code rows} before insert/update/delete. */
+  private void materializeForWrite() {
+    ensureLoaded();
+    if (fileRows == null || !rows.isEmpty()) {
+      return;
+    }
+    FileBackedRows src = fileRows;
+    fileRows = null;
+    loading = true;
+    try {
+      boolean indexesReady = primaryIndexBuilt;
+      for (IndexMap map : indexMaps) {
+        if (map.populated) {
+          indexesReady = true;
+          break;
+        }
+      }
+      int n = src.rowCount();
+      for (int i = 0; i < n; i++) {
+        rows.add(src.copyRow(i));
+        // Row ordinals stay the same — do not double-fill already-built postings.
+        if (!indexesReady) {
+          indexRow(rows.get(i), i);
+        }
+      }
+      for (IndexMap map : indexMaps) {
+        map.populated = true;
+      }
+      primaryIndexBuilt = true;
+    } finally {
+      loading = false;
+    }
+  }
+
+  private boolean primaryIndexBuilt;
 
   void restructure(
       String name,
@@ -43,6 +250,8 @@ public final class Table {
       List<TableConstraint> constraints,
       String sql,
       List<Object[]> newRows) {
+    markMutated();
+    deferredLoad = null;
     install(name, columns, constraints, sql);
     rows.clear();
     nextId = 1;
@@ -77,9 +286,11 @@ public final class Table {
     this.sql = sql;
     this.columns.clear();
     this.columns.addAll(columns);
+    rebuildColumnIndex();
     this.primaryKey = resolvePrimaryKey(constraints, sql);
     this.integerPkIndex = singleIntegerPrimaryKey();
     primaryIndex.clear();
+    primaryIndexBuilt = false;
     validate(constraints, sql);
     uniqueKeys.clear();
     indexMaps.clear();
@@ -130,19 +341,30 @@ public final class Table {
   }
 
   public int columnIndex(String columnName) {
+    Integer hit = columnByLower.get(columnName.toLowerCase(Locale.ROOT));
+    return hit == null ? -1 : hit;
+  }
+
+  private void rebuildColumnIndex() {
+    columnByLower.clear();
     for (int i = 0; i < columns.size(); i++) {
-      if (same(columns.get(i).name(), columnName)) {
-        return i;
-      }
+      columnByLower.put(columns.get(i).name().toLowerCase(Locale.ROOT), i);
     }
-    return -1;
   }
 
   public int rowCount() {
+    if (fileRows != null && !mutated) {
+      return fileRows.rowCount();
+    }
+    ensureLoaded();
     return rows.size();
   }
 
   public Object[] copyRow(int row) {
+    if (fileRows != null && !mutated) {
+      return fileRows.copyRow(row);
+    }
+    ensureLoaded();
     return rows.get(row).clone();
   }
 
@@ -150,6 +372,16 @@ public final class Table {
     if (column < 0 || value == null) {
       return false;
     }
+    if (fileRows != null && !mutated) {
+      int n = fileRows.rowCount();
+      for (int i = 0; i < n; i++) {
+        if (value.equals(fileRows.value(i, column))) {
+          return true;
+        }
+      }
+      return false;
+    }
+    ensureLoaded();
     for (Object[] row : rows) {
       if (value.equals(row[column])) {
         return true;
@@ -163,11 +395,15 @@ public final class Table {
     if (integerPkIndex < 0 || !columns.get(integerPkIndex).autoincrement()) {
       return null;
     }
-    Object value = rows.get(row)[integerPkIndex];
+    Object value = value(row, integerPkIndex);
     return value instanceof Long id ? id : null;
   }
 
   public Object value(int row, int column) {
+    if (fileRows != null && !mutated) {
+      return fileRows.value(row, column);
+    }
+    ensureLoaded();
     return rows.get(row)[column];
   }
 
@@ -184,6 +420,7 @@ public final class Table {
     if (primaryKey.length == 0 || primaryKey.length != key.length) {
       return -1;
     }
+    ensurePrimaryIndex();
     Object mapKey = compactKey(key);
     if (mapKey == null) {
       return -1;
@@ -202,6 +439,7 @@ public final class Table {
     if (map == null) {
       return null;
     }
+    populateIndexIfNeeded(map);
     Object mapKey = compactKey(key);
     if (mapKey == null) {
       return EMPTY_ROWS;
@@ -214,11 +452,11 @@ public final class Table {
     if (hits == null || hits.isEmpty()) {
       return EMPTY_ROWS;
     }
-    int[] rows = new int[hits.size()];
+    int[] out = new int[hits.size()];
     for (int i = 0; i < hits.size(); i++) {
-      rows[i] = hits.get(i);
+      out[i] = hits.get(i);
     }
-    return rows;
+    return out;
   }
 
   public boolean isUniqueIndex(int[] columns) {
@@ -251,7 +489,31 @@ public final class Table {
     return list;
   }
 
+  /**
+   * Ensure a (non-unique) secondary index exists for these columns so SeekIdx can probe without a
+   * nested full scan. No-op when the primary key or an existing index already covers the set.
+   */
+  public void ensureIndex(int[] columns) {
+    if (columns == null || columns.length == 0) {
+      return;
+    }
+    if (primaryKey.length > 0 && sameSet(columns, primaryKey)) {
+      ensurePrimaryIndex();
+      return;
+    }
+    IndexMap existing = findIndexMap(columns);
+    if (existing != null) {
+      populateIndexIfNeeded(existing);
+      return;
+    }
+    IndexMap map = new IndexMap(columns.clone(), -1, false);
+    indexMaps.add(map);
+    populateIndexIfNeeded(map);
+  }
+
   public Place place(Object[] raw, InsertMode mode, int[] conflictTarget) {
+    materializeForWrite();
+    markMutated();
     Object[] row = checkValues(raw, true);
     if (mode == InsertMode.UPSERT && (conflictTarget == null || !hasUnique(conflictTarget))) {
       throw new SqlException("ON CONFLICT clause does not match a unique constraint: " + name);
@@ -294,6 +556,8 @@ public final class Table {
   }
 
   public void replace(int row, Object[] values) {
+    materializeForWrite();
+    markMutated();
     Object[] checked = checkValues(values, false);
     for (UniqueKey key : uniqueKeys) {
       if (skips(key, checked)) {
@@ -310,6 +574,8 @@ public final class Table {
   }
 
   public void remove(int row) {
+    materializeForWrite();
+    markMutated();
     rows.remove(row);
     rebuildAllIndexes();
   }
@@ -318,8 +584,9 @@ public final class Table {
     if (values == null || values.length != columns.size()) {
       return -1;
     }
-    for (int row = 0; row < rows.size(); row++) {
-      Object[] current = rows.get(row);
+    int n = rowCount();
+    for (int row = 0; row < n; row++) {
+      Object[] current = copyRow(row);
       boolean same = true;
       for (int column = 0; column < current.length; column++) {
         if (!java.util.Objects.equals(current[column], values[column])) {
@@ -344,7 +611,10 @@ public final class Table {
     if (column.notNull() && !column.hasDefault()) {
       throw new SqlException("NOT NULL column needs a default: " + SqlText.snippet(sql));
     }
+    materializeForWrite();
+    markMutated();
     columns.add(column);
+    rebuildColumnIndex();
     Object fill = column.notNull() ? column.defaultValue() : null;
     for (int i = 0; i < rows.size(); i++) {
       Object[] old = rows.get(i);
@@ -359,25 +629,17 @@ public final class Table {
     if (!sameSet(keyColumns, primaryKey)) {
       IndexMap map = new IndexMap(keyColumns.clone(), partialColumn, true);
       indexMaps.add(map);
-      for (int i = 0; i < rows.size(); i++) {
-        indexOne(map, rows.get(i), i);
-      }
+      populateIndexIfNeeded(map);
     }
   }
 
   void addNonUniqueIndex(int[] keyColumns, int partialColumn) {
     IndexMap map = new IndexMap(keyColumns.clone(), partialColumn, false);
     indexMaps.add(map);
-    for (int i = 0; i < rows.size(); i++) {
-      indexOne(map, rows.get(i), i);
-    }
+    populateIndexIfNeeded(map);
   }
 
   State capture() {
-    List<Object[]> copy = new ArrayList<>(rows.size());
-    for (Object[] row : rows) {
-      copy.add(row.clone());
-    }
     List<UniqueKey> keys = new ArrayList<>(uniqueKeys.size());
     for (UniqueKey key : uniqueKeys) {
       keys.add(new UniqueKey(key.columns.clone(), key.partial));
@@ -386,6 +648,27 @@ public final class Table {
     for (IndexMap map : indexMaps) {
       specs.add(new IndexSpec(map.columns.clone(), map.partial, map.unique));
     }
+    // Keep deferred / file-backed tables lazy across transaction snapshots.
+    if (deferredLoad != null || (fileRows != null && rows.isEmpty() && !mutated)) {
+      return new State(
+          name,
+          sql,
+          List.copyOf(columns),
+          primaryKey.clone(),
+          integerPkIndex,
+          List.of(),
+          nextId,
+          keys,
+          specs,
+          List.copyOf(foreignKeys),
+          deferredLoad,
+          sourceRootPage,
+          mutated,
+          fileRows,
+          sidecarPath);
+    }
+    // Share row array references: place/replace never mutate an Object[] already in rows.
+    List<Object[]> copy = new ArrayList<>(rows);
     return new State(
         name,
         sql,
@@ -396,7 +679,12 @@ public final class Table {
         nextId,
         keys,
         specs,
-        List.copyOf(foreignKeys));
+        List.copyOf(foreignKeys),
+        null,
+        sourceRootPage,
+        mutated,
+        null,
+        sidecarPath);
   }
 
   void restore(State state) {
@@ -404,10 +692,9 @@ public final class Table {
     sql = state.sql;
     columns.clear();
     columns.addAll(state.columns);
+    rebuildColumnIndex();
     primaryKey = state.primaryKey.clone();
     integerPkIndex = state.integerPkIndex;
-    rows.clear();
-    rows.addAll(state.rows);
     nextId = state.nextId;
     uniqueKeys.clear();
     uniqueKeys.addAll(state.keys);
@@ -418,6 +705,18 @@ public final class Table {
     for (IndexSpec spec : state.indexSpecs) {
       indexMaps.add(new IndexMap(spec.columns.clone(), spec.partial, spec.unique));
     }
+    rows.clear();
+    primaryIndex.clear();
+    primaryIndexBuilt = false;
+    deferredLoad = state.deferredLoad;
+    sourceRootPage = state.sourceRootPage;
+    mutated = state.mutated;
+    fileRows = state.fileRows;
+    sidecarPath = state.sidecarPath;
+    if (deferredLoad != null || fileRows != null) {
+      return;
+    }
+    rows.addAll(state.rows);
     rebuildAllIndexes();
   }
 
@@ -622,13 +921,68 @@ public final class Table {
 
   private void rebuildAllIndexes() {
     primaryIndex.clear();
+    primaryIndexBuilt = false;
     for (IndexMap map : indexMaps) {
       map.uniqueRows.clear();
       map.multiRows.clear();
+      map.populated = false;
     }
     for (int i = 0; i < rows.size(); i++) {
       indexRow(rows.get(i), i);
     }
+    if (!rows.isEmpty() || fileRows == null) {
+      primaryIndexBuilt = true;
+      for (IndexMap map : indexMaps) {
+        map.populated = true;
+      }
+    }
+  }
+
+  private void populateIndexIfNeeded(IndexMap map) {
+    if (map.populated) {
+      return;
+    }
+    if (fileRows != null && !mutated && rows.isEmpty()) {
+      int n = fileRows.rowCount();
+      for (int i = 0; i < n; i++) {
+        indexOne(map, fileRows.peekRow(i), i);
+      }
+      map.populated = true;
+      return;
+    }
+    ensureLoaded();
+    map.uniqueRows.clear();
+    map.multiRows.clear();
+    for (int i = 0; i < rows.size(); i++) {
+      indexOne(map, rows.get(i), i);
+    }
+    map.populated = true;
+  }
+
+  private void ensurePrimaryIndex() {
+    if (primaryIndexBuilt || primaryKey.length == 0) {
+      return;
+    }
+    if (fileRows != null && !mutated && rows.isEmpty()) {
+      int n = fileRows.rowCount();
+      for (int i = 0; i < n; i++) {
+        Object mapKey = keyOfRow(fileRows.peekRow(i), primaryKey);
+        if (mapKey != null) {
+          primaryIndex.put(mapKey, i);
+        }
+      }
+      primaryIndexBuilt = true;
+      return;
+    }
+    ensureLoaded();
+    primaryIndex.clear();
+    for (int i = 0; i < rows.size(); i++) {
+      Object mapKey = keyOfRow(rows.get(i), primaryKey);
+      if (mapKey != null) {
+        primaryIndex.put(mapKey, i);
+      }
+    }
+    primaryIndexBuilt = true;
   }
 
   private void indexRow(Object[] row, int index) {
@@ -766,6 +1120,8 @@ public final class Table {
     private final boolean unique;
     private final Map<Object, Integer> uniqueRows = new HashMap<>();
     private final Map<Object, ArrayList<Integer>> multiRows = new HashMap<>();
+    /** False until filled from rows / file; schema-only maps start empty. */
+    private boolean populated;
 
     private IndexMap(int[] columns, int partial, boolean unique) {
       this.columns = columns;
@@ -785,6 +1141,11 @@ public final class Table {
     private final List<UniqueKey> keys;
     private final List<IndexSpec> indexSpecs;
     private final List<ForeignKeyConstraint> foreignKeys;
+    private final Runnable deferredLoad;
+    private final int sourceRootPage;
+    private final boolean mutated;
+    private final FileBackedRows fileRows;
+    private final java.nio.file.Path sidecarPath;
 
     private State(
         String name,
@@ -796,7 +1157,12 @@ public final class Table {
         long nextId,
         List<UniqueKey> keys,
         List<IndexSpec> indexSpecs,
-        List<ForeignKeyConstraint> foreignKeys) {
+        List<ForeignKeyConstraint> foreignKeys,
+        Runnable deferredLoad,
+        int sourceRootPage,
+        boolean mutated,
+        FileBackedRows fileRows,
+        java.nio.file.Path sidecarPath) {
       this.name = name;
       this.sql = sql;
       this.columns = columns;
@@ -807,6 +1173,11 @@ public final class Table {
       this.keys = keys;
       this.indexSpecs = indexSpecs;
       this.foreignKeys = foreignKeys;
+      this.deferredLoad = deferredLoad;
+      this.sourceRootPage = sourceRootPage;
+      this.mutated = mutated;
+      this.fileRows = fileRows;
+      this.sidecarPath = sidecarPath;
     }
   }
 }

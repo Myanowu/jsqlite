@@ -1,15 +1,24 @@
 package com.myano.jsqlite;
 
 import com.myano.jsqlite.format.Btree;
+import com.myano.jsqlite.format.SqliteHeader;
 import com.myano.jsqlite.format.SqliteReader;
+import com.myano.jsqlite.format.TableSidecars;
 import com.myano.jsqlite.wal.Checkpoint;
 import com.myano.jsqlite.wal.LockFile;
 import com.myano.jsqlite.wal.WalWriter;
 import com.myano.jsqlite.sql.Ast.AlterTable;
+import com.myano.jsqlite.sql.Ast.ColumnRef;
+import com.myano.jsqlite.sql.Ast.Compound;
 import com.myano.jsqlite.sql.Ast.CreateIndex;
 import com.myano.jsqlite.sql.Ast.CreateTable;
 import com.myano.jsqlite.sql.Ast.Delete;
+import com.myano.jsqlite.sql.Ast.Expr;
 import com.myano.jsqlite.sql.Ast.Insert;
+import com.myano.jsqlite.sql.Ast.LiteralExpr;
+import com.myano.jsqlite.sql.Ast.NumberLiteral;
+import com.myano.jsqlite.sql.Ast.OrderItem;
+import com.myano.jsqlite.sql.Ast.Parameter;
 import com.myano.jsqlite.sql.Ast.Pragma;
 import com.myano.jsqlite.sql.Ast.Select;
 import com.myano.jsqlite.sql.Ast.Statement;
@@ -21,6 +30,7 @@ import com.myano.jsqlite.sql.SqlText;
 import com.myano.jsqlite.store.Column;
 import com.myano.jsqlite.store.ColumnType;
 import com.myano.jsqlite.store.IndexDef;
+import com.myano.jsqlite.store.RatioAutoIndex;
 import com.myano.jsqlite.store.Table;
 import com.myano.jsqlite.store.TableInfo;
 import com.myano.jsqlite.vm.Program;
@@ -137,6 +147,27 @@ public final class Database implements AutoCloseable {
     return engine.foreignKeys;
   }
 
+  /** Parse/compile once for JDBC PreparedStatement; reuse via {@link #runPrepared}. */
+  public Prepared prepare(String sql) {
+    ensureOpen();
+    Statement statement = parser.parse(sql);
+    Program program = null;
+    if (statement instanceof Insert || statement instanceof Update || statement instanceof Delete) {
+      program = compiler.compile(statement, engine.catalog, sql);
+    }
+    return new Prepared(sql, statement, program, Parameters.count(statement));
+  }
+
+  /** Execute a previously prepared DML/SELECT without re-parsing or recompiling. */
+  public Outcome runPrepared(Prepared prepared, Object... bindings) {
+    ensureOpen();
+    Object[] values = normalize(prepared.sql(), bindings);
+    if (prepared.parameterCount() != values.length) {
+      throw new SqlException("binding count mismatch: " + SqlText.snippet(prepared.sql()));
+    }
+    return executeParsed(prepared.sql(), prepared.statement(), prepared.program(), values);
+  }
+
   /** JDBC 入口。已有的 sqlite 主檔拒絕寫入。新建的庫在語句成功後把頁寫回檔案。 */
   public Outcome run(String sql, Object... bindings) {
     ensureOpen();
@@ -145,11 +176,19 @@ public final class Database implements AutoCloseable {
     if (Parameters.count(statement) != values.length) {
       throw new SqlException("binding count mismatch: " + SqlText.snippet(sql));
     }
+    return executeParsed(sql, statement, null, values);
+  }
+
+  private Outcome executeParsed(String sql, Statement statement, Program preparedProgram, Object[] values) {
     enter();
     try {
       if (statement instanceof Select select) {
         ensureTransaction();
         return selectOutcome(select, sql, values);
+      }
+      if (statement instanceof Compound compound) {
+        ensureTransaction();
+        return compoundOutcome(compound, sql, values);
       }
       if (statement instanceof Pragma pragma) {
         return pragma(pragma, sql);
@@ -166,7 +205,11 @@ public final class Database implements AutoCloseable {
       engine.catalog.resetChanges();
       engine.catalog.beginStatement();
       try {
-        apply(statement, values, sql);
+        if (preparedProgram != null) {
+          vm.execute(preparedProgram, engine.catalog, values);
+        } else {
+          apply(statement, values, sql);
+        }
         engine.catalog.endStatement();
         wrote();
         markUncommittedWrite();
@@ -188,7 +231,7 @@ public final class Database implements AutoCloseable {
   public void execute(String sql, Object... bindings) {
     ensureOpen();
     Statement statement = parser.parse(sql);
-    if (statement instanceof Select) {
+    if (statement instanceof Select || statement instanceof Compound) {
       throw new SqlException("SELECT must be run with query: " + SqlText.snippet(sql));
     }
     if (readOnly && !(statement instanceof Insert || statement instanceof Update || statement instanceof Delete)) {
@@ -223,9 +266,6 @@ public final class Database implements AutoCloseable {
   public List<Row> query(String sql, Object... bindings) {
     ensureOpen();
     Statement statement = parser.parse(sql);
-    if (!(statement instanceof Select select)) {
-      throw new SqlException("query only accepts SELECT: " + SqlText.snippet(sql));
-    }
     Object[] values = normalize(sql, bindings);
     if (Parameters.count(statement) != values.length) {
       throw new SqlException("binding count mismatch: " + SqlText.snippet(sql));
@@ -233,6 +273,12 @@ public final class Database implements AutoCloseable {
     enter();
     try {
       ensureTransaction();
+      if (statement instanceof Compound compound) {
+        return compoundOutcome(compound, sql, values).rows();
+      }
+      if (!(statement instanceof Select select)) {
+        throw new SqlException("query only accepts SELECT: " + SqlText.snippet(sql));
+      }
       return queryRows(select, sql, values);
     } finally {
       releaseGateAfterStatement();
@@ -359,14 +405,92 @@ public final class Database implements AutoCloseable {
       return;
     }
     engine.catalog.syncSequences();
-    byte[][] image = Btree.image(engine.catalog);
+    byte[][] image;
+    if (engine.dataPin != null) {
+      image =
+          Btree.image(
+              engine.catalog, engine.dataPin.image(), engine.dataPin.pageSize());
+    } else {
+      image = Btree.image(engine.catalog);
+    }
     if ("wal".equals(engine.journalMode)) {
       try (LockFile write = LockFile.acquireWrite(path, engine.busyTimeout)) {
         WalWriter.commit(path, image);
         engine.pager.replace(image);
       }
+      engine.releaseSidecars();
+      rewriteDirtySidecars();
+      engine.reattachAfterPersist();
     } else {
-      engine.pager.commit(image);
+      Path tmp = path.resolveSibling(path.getFileName().toString() + ".tmp");
+      try {
+        writePages(tmp, image);
+        // Close mappings before replacing files on Windows (replace while mapped → AccessDenied).
+        engine.releaseSidecars();
+        engine.releaseDataPin();
+        rewriteDirtySidecars();
+        replaceDatabaseFile(tmp, path);
+      } catch (java.io.IOException ex) {
+        throw new SqlException("unable to write " + path + ": " + ex.getMessage());
+      } finally {
+        try {
+          java.nio.file.Files.deleteIfExists(tmp);
+        } catch (java.io.IOException ignored) {
+        }
+      }
+      engine.pager.replace(image);
+      engine.reattachAfterPersist();
+    }
+  }
+
+  /** Sidecar rewrite must run after {@link Engine#releaseSidecars()} so the path is not mapped. */
+  private void rewriteDirtySidecars() {
+    for (TableInfo info : engine.catalog.tables()) {
+      Table table = engine.catalog.find(info.name());
+      if (table != null && table.isSidecar() && table.isMutated()) {
+        TableSidecars.writeMutated(table);
+      }
+    }
+  }
+
+  private static void replaceDatabaseFile(Path tmp, Path path) throws java.io.IOException {
+    try {
+      java.nio.file.Files.move(
+          tmp,
+          path,
+          java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+          java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+    } catch (java.nio.file.AtomicMoveNotSupportedException
+        | java.nio.file.AccessDeniedException ex) {
+      java.nio.file.Files.move(tmp, path, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+    }
+  }
+
+  /**
+   * Offline / ops: copy one table into {@code main.sidecars/Name.jsqlite}. Peak heap ≈ that table's
+   * page footprint. Reopen the database (or {@code PRAGMA jsqlite_split_table(Name)} while open) to
+   * mount the sidecar. Does not shrink {@code main} — use {@link #compactSidecars}.
+   */
+  public static Path splitTable(Path main, String tableName) {
+    return TableSidecars.extract(main, tableName);
+  }
+
+  /**
+   * Offline / ops: drop sidecar table payloads from the main file (empty leaves). Sidecar siblings
+   * keep the rows. Peak heap ≈ size of remaining non-sidecar pages.
+   */
+  public static long compactSidecars(Path main) {
+    return TableSidecars.compactMain(main);
+  }
+
+  private static void writePages(Path target, byte[][] pages) throws java.io.IOException {
+    try (java.io.RandomAccessFile file = new java.io.RandomAccessFile(target.toFile(), "rw")) {
+      file.setLength((long) pages.length * com.myano.jsqlite.format.Pager.PAGE_SIZE);
+      for (int i = 0; i < pages.length; i++) {
+        file.seek((long) i * com.myano.jsqlite.format.Pager.PAGE_SIZE);
+        file.write(pages[i]);
+      }
+      file.getFD().sync();
     }
   }
 
@@ -484,6 +608,155 @@ public final class Database implements AutoCloseable {
     return unique;
   }
 
+  private Outcome compoundOutcome(Compound compound, String sql, Object[] values) {
+    if (compound.arms().isEmpty()) {
+      throw new SqlException("UNION needs a SELECT: " + SqlText.snippet(sql));
+    }
+    List<String> columns = null;
+    List<Row> combined = new ArrayList<>();
+    for (int i = 0; i < compound.arms().size(); i++) {
+      Outcome arm = selectOutcome(compound.arms().get(i), sql, values);
+      if (columns == null) {
+        columns = arm.columns();
+      } else if (arm.columns().size() != columns.size()) {
+        throw new SqlException("UNION arms have different column counts: " + SqlText.snippet(sql));
+      }
+      List<Row> right = new ArrayList<>();
+      for (Row row : arm.rows()) {
+        right.add(new Row(columns, row.values()));
+      }
+      if (i > 0 && !compound.unionAll().get(i - 1)) {
+        combined = unionDistinct(combined, right, columns);
+      } else {
+        combined.addAll(right);
+      }
+    }
+    sortUnion(combined, compound.orderBy(), columns, sql);
+    combined = sliceUnion(combined, compound.limit(), compound.offset(), values, sql);
+    return Outcome.rows(columns, combined);
+  }
+
+  private static List<Row> unionDistinct(List<Row> left, List<Row> right, List<String> columns) {
+    List<Row> unique = new ArrayList<>();
+    for (Row row : left) {
+      addUnique(unique, new Row(columns, row.values()));
+    }
+    for (Row row : right) {
+      addUnique(unique, row);
+    }
+    return unique;
+  }
+
+  private static void addUnique(List<Row> unique, Row row) {
+    for (Row existing : unique) {
+      if (existing.values().equals(row.values())) {
+        return;
+      }
+    }
+    unique.add(row);
+  }
+
+  private static void sortUnion(List<Row> rows, List<OrderItem> orderBy, List<String> columns, String sql) {
+    if (orderBy.isEmpty() || rows.size() < 2) {
+      return;
+    }
+    int[] indexes = new int[orderBy.size()];
+    boolean[] descending = new boolean[orderBy.size()];
+    for (int i = 0; i < orderBy.size(); i++) {
+      indexes[i] = unionOrderIndex(orderBy.get(i).expr(), columns, sql);
+      descending[i] = orderBy.get(i).descending();
+    }
+    rows.sort((left, right) -> {
+      for (int i = 0; i < indexes.length; i++) {
+        int compared = compareSort(left.values().get(indexes[i]), right.values().get(indexes[i]));
+        if (compared != 0) {
+          return descending[i] ? -compared : compared;
+        }
+      }
+      return 0;
+    });
+  }
+
+  private static int unionOrderIndex(Expr expr, List<String> columns, String sql) {
+    if (expr instanceof ColumnRef column) {
+      if (column.table() != null) {
+        throw new SqlException("UNION ORDER BY cannot use a table qualifier: " + SqlText.snippet(sql));
+      }
+      for (int i = 0; i < columns.size(); i++) {
+        if (columns.get(i).equalsIgnoreCase(column.name())) {
+          return i;
+        }
+      }
+    }
+    if (expr instanceof LiteralExpr literal && literal.literal() instanceof NumberLiteral number) {
+      int ordinal = (int) number.value();
+      if (ordinal >= 1 && ordinal <= columns.size()) {
+        return ordinal - 1;
+      }
+    }
+    throw new SqlException("UNION ORDER BY must name a result column: " + SqlText.snippet(sql));
+  }
+
+  private static int compareSort(Object left, Object right) {
+    if (left == null && right == null) {
+      return 0;
+    }
+    if (left == null) {
+      return -1;
+    }
+    if (right == null) {
+      return 1;
+    }
+    Double leftNumber = sortNumber(left);
+    Double rightNumber = sortNumber(right);
+    if (leftNumber != null && rightNumber != null) {
+      return Double.compare(leftNumber, rightNumber);
+    }
+    return String.valueOf(left).compareTo(String.valueOf(right));
+  }
+
+  private static Double sortNumber(Object value) {
+    if (value instanceof Boolean bit) {
+      return bit ? 1d : 0d;
+    }
+    if (value instanceof Number number) {
+      return number.doubleValue();
+    }
+    return null;
+  }
+
+  private static List<Row> sliceUnion(
+      List<Row> rows, Expr limit, Expr offset, Object[] values, String sql) {
+    int start = offset == null ? 0 : unionLimit(offset, values, sql);
+    if (start < 0) {
+      start = 0;
+    }
+    if (start >= rows.size()) {
+      return List.of();
+    }
+    int end = rows.size();
+    if (limit != null) {
+      end = Math.min(end, start + Math.max(unionLimit(limit, values, sql), 0));
+    }
+    if (start == 0 && end == rows.size()) {
+      return rows;
+    }
+    return new ArrayList<>(rows.subList(start, end));
+  }
+
+  private static int unionLimit(Expr expr, Object[] values, String sql) {
+    if (expr instanceof LiteralExpr literal && literal.literal() instanceof NumberLiteral number) {
+      return (int) number.value();
+    }
+    if (expr instanceof Parameter parameter) {
+      Object value = values[parameter.index()];
+      if (value instanceof Number number) {
+        return number.intValue();
+      }
+    }
+    throw new SqlException("UNION TOP must be a number: " + SqlText.snippet(sql));
+  }
+
   private void apply(Statement statement, Object[] values, String sql) {
     switch (statement) {
       case CreateTable create -> engine.catalog.createTable(
@@ -507,16 +780,141 @@ public final class Database implements AutoCloseable {
   }
 
   private Outcome pragma(Pragma pragma, String sql) {
-    if (pragma.argument() != null && pragma.value() != null) {
+    String pragmaName = pragma.name().toLowerCase(Locale.ROOT);
+    // jsqlite_ratio_index(minRows)=minRatio uses both argument and value.
+    if (!"jsqlite_ratio_index".equals(pragmaName)
+        && pragma.argument() != null
+        && pragma.value() != null) {
       throw new SqlException("unsupported pragma: " + SqlText.snippet(sql));
     }
-    return switch (pragma.name().toLowerCase(Locale.ROOT)) {
+    return switch (pragmaName) {
       case "journal_mode" -> journalMode(pragma, sql);
       case "busy_timeout" -> busyTimeout(pragma, sql);
       case "foreign_keys" -> foreignKeys(pragma, sql);
+      case "bulk_load" -> bulkLoad(pragma, sql);
       case "table_info" -> tableInfo(pragma, sql);
+      case "freelist_count" -> freelistCount(pragma, sql);
+      case "wal_checkpoint" -> walCheckpoint(pragma, sql);
+      case "jsqlite_split_table" -> jsqliteSplitTable(pragma, sql);
+      case "jsqlite_sidecars" -> jsqliteSidecars(pragma, sql);
+      case "jsqlite_ratio_index" -> jsqliteRatioIndex(pragma, sql);
+      case "jsqlite_analyze" -> jsqliteAnalyze(pragma, sql);
       default -> throw new SqlException("unsupported pragma: " + SqlText.snippet(sql));
     };
+  }
+
+  /** PRAGMA jsqlite_ratio_index — show; PRAGMA jsqlite_ratio_index(minRows)=minRatio — set. */
+  private Outcome jsqliteRatioIndex(Pragma pragma, String sql) {
+    if (pragma.argument() != null || pragma.value() != null) {
+      if (pragma.argument() == null || pragma.value() == null) {
+        throw new SqlException(
+            "jsqlite_ratio_index set form is PRAGMA jsqlite_ratio_index(minRows)=minRatio: "
+                + SqlText.snippet(sql));
+      }
+      try {
+        RatioAutoIndex.configure(
+            Long.parseLong(pragma.argument().trim()), Integer.parseInt(pragma.value().trim()));
+      } catch (NumberFormatException ex) {
+        throw new SqlException(
+            "jsqlite_ratio_index needs integers minRows,minRatio: " + SqlText.snippet(sql));
+      }
+    }
+    List<String> columns = List.of("min_rows", "min_ratio");
+    return Outcome.rows(
+        columns,
+        List.of(new Row(columns, List.of(RatioAutoIndex.minRows, (long) RatioAutoIndex.minRatio))));
+  }
+
+  /** PRAGMA jsqlite_analyze(Table) — force ratio auto-index discovery now. */
+  private Outcome jsqliteAnalyze(Pragma pragma, String sql) {
+    if (pragma.value() != null || pragma.argument() == null) {
+      throw new SqlException("jsqlite_analyze needs a table name: " + SqlText.snippet(sql));
+    }
+    Table table = engine.catalog.find(pragma.argument());
+    if (table == null) {
+      throw new SqlException("unknown table " + pragma.argument() + ": " + SqlText.snippet(sql));
+    }
+    table.resetRatioAnalyzed();
+    RatioAutoIndex.ensure(table);
+    int indexed = table.secondaryIndexColumns().size();
+    return oneColumn("jsqlite_analyze", (long) indexed);
+  }
+
+  private Outcome jsqliteSplitTable(Pragma pragma, String sql) {
+    if (pragma.value() != null || pragma.argument() == null) {
+      throw new SqlException(
+          "jsqlite_split_table needs a table name: " + SqlText.snippet(sql));
+    }
+    if (engine.pager == null || path == null) {
+      throw new SqlException("jsqlite_split_table needs a file database: " + SqlText.snippet(sql));
+    }
+    Table table = engine.catalog.find(pragma.argument());
+    if (table == null) {
+      throw new SqlException("unknown table " + pragma.argument() + ": " + SqlText.snippet(sql));
+    }
+    if (table.isMutated()) {
+      throw new SqlException(
+          "jsqlite_split_table needs an unmodified table (commit or reopen first): "
+              + SqlText.snippet(sql));
+    }
+    Path sidecar = TableSidecars.extract(path, pragma.argument());
+    engine.mountSidecars();
+    return oneColumn("jsqlite_split_table", sidecar.toString());
+  }
+
+  private Outcome jsqliteSidecars(Pragma pragma, String sql) {
+    if (pragma.argument() != null || pragma.value() != null) {
+      throw new SqlException("jsqlite_sidecars takes no arguments: " + SqlText.snippet(sql));
+    }
+    List<String> columns = List.of("name", "path", "mounted");
+    List<Row> rows = new ArrayList<>();
+    if (path != null) {
+      for (String name : TableSidecars.listed(path)) {
+        Table table = engine.catalog.find(name);
+        boolean mounted = table != null && table.isSidecar();
+        rows.add(
+            new Row(
+                columns,
+                List.of(name, TableSidecars.tableFile(path, name).toString(), mounted ? 1L : 0L)));
+      }
+    }
+    return Outcome.rows(columns, rows);
+  }
+
+  private Outcome freelistCount(Pragma pragma, String sql) {
+    if (pragma.argument() != null || pragma.value() != null) {
+      throw new SqlException("freelist_count takes no arguments: " + SqlText.snippet(sql));
+    }
+    long count = 0L;
+    if (engine.pager != null && engine.pager.pageCount() >= 1) {
+      count = SqliteHeader.freelistCount(engine.pager.page(1));
+    }
+    return oneColumn("freelist_count", count);
+  }
+
+  private Outcome walCheckpoint(Pragma pragma, String sql) {
+    if (pragma.value() != null) {
+      throw new SqlException("wal_checkpoint uses PRAGMA wal_checkpoint(MODE): " + SqlText.snippet(sql));
+    }
+    String mode = pragma.argument() == null ? "passive" : pragma.argument().toLowerCase(Locale.ROOT);
+    if (!mode.equals("passive")
+        && !mode.equals("full")
+        && !mode.equals("restart")
+        && !mode.equals("truncate")) {
+      throw new SqlException("unsupported wal_checkpoint mode " + pragma.argument() + ": " + SqlText.snippet(sql));
+    }
+    if (engine.pager == null) {
+      throw new SqlException("wal_checkpoint needs a file database: " + SqlText.snippet(sql));
+    }
+    if (!"wal".equals(engine.journalMode)) {
+      throw new SqlException("wal_checkpoint needs journal_mode=WAL: " + SqlText.snippet(sql));
+    }
+    try (LockFile write = LockFile.acquireWrite(path, engine.busyTimeout)) {
+      Checkpoint.run(path);
+    }
+    List<String> columns = List.of("busy", "log", "checkpointed");
+    List<Object> values = List.of(0L, 0L, 0L);
+    return Outcome.rows(columns, List.of(new Row(columns, values)));
   }
 
   private Outcome journalMode(Pragma pragma, String sql) {
@@ -572,6 +970,21 @@ public final class Database implements AutoCloseable {
       engine.catalog.setEnforceForeignKeys(on);
     }
     return oneColumn("foreign_keys", engine.foreignKeys ? 1L : 0L);
+  }
+
+  private Outcome bulkLoad(Pragma pragma, String sql) {
+    if (pragma.argument() != null) {
+      throw new SqlException("unsupported pragma: " + SqlText.snippet(sql));
+    }
+    if (pragma.value() != null) {
+      boolean on = switch (pragma.value().toLowerCase(Locale.ROOT)) {
+        case "on", "1" -> true;
+        case "off", "0" -> false;
+        default -> throw new SqlException("bulk_load needs ON or OFF: " + SqlText.snippet(sql));
+      };
+      engine.catalog.setBulkLoad(on);
+    }
+    return oneColumn("bulk_load", engine.catalog.bulkLoad() ? 1L : 0L);
   }
 
   private Outcome tableInfo(Pragma pragma, String sql) {
@@ -690,6 +1103,8 @@ public final class Database implements AutoCloseable {
       throw new IllegalStateException("database is closed");
     }
   }
+
+  public record Prepared(String sql, Statement statement, Program program, int parameterCount) {}
 
   public record Outcome(List<String> columns, List<Row> rows, int updateCount, Long generatedKey) {
     public static Outcome rows(List<String> columns, List<Row> rows) {

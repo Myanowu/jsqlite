@@ -111,6 +111,53 @@ class DialectTest {
   }
 
   @Test
+  void leftJoinAutoIndexAvoidsNestedScan() {
+    try (Database db = open()) {
+      db.execute("CREATE TABLE acct (Company TEXT, COACode TEXT, GLAccount TEXT, AccountDesc TEXT)");
+      db.execute(
+          "CREATE TABLE disp (Company TEXT, COACode TEXT, GLAccount TEXT, GLAcctDisp TEXT)");
+      for (int i = 0; i < 2000; i++) {
+        String code = String.format("%04d", i);
+        db.execute(
+            "INSERT INTO acct VALUES ('ELCSS', 'MAIN', ?, ?)", code, "desc-" + code);
+        if (i % 2 == 0) {
+          db.execute(
+              "INSERT INTO disp VALUES ('ELCSS', 'MAIN', ?, ?)", code, "disp-" + code);
+        }
+      }
+      db.execute("INSERT INTO acct VALUES ('ELCSS', 'MAIN', 'ZZZZ', 'lonely')");
+      List<Row> rows =
+          db.query(
+              """
+              SELECT TOP (100) a.GLAccount, d.GLAcctDisp
+              FROM acct a
+              LEFT JOIN disp d
+                ON d.Company = a.Company AND d.COACode = a.COACode AND d.GLAccount = a.GLAccount
+              WHERE a.Company = ?
+                AND (a.GLAccount LIKE ? OR COALESCE(d.GLAcctDisp, '') LIKE ?)
+              ORDER BY a.GLAccount
+              """,
+              "ELCSS",
+              "%00%",
+              "%00%");
+      assertTrue(rows.size() <= 100);
+      assertTrue(rows.size() > 0);
+      List<Row> miss =
+          db.query(
+              """
+              SELECT a.GLAccount, d.GLAcctDisp
+              FROM acct a
+              LEFT JOIN disp d
+                ON d.Company = a.Company AND d.COACode = a.COACode AND d.GLAccount = a.GLAccount
+              WHERE a.GLAccount = 'ZZZZ'
+              """);
+      assertEquals(1, miss.size());
+      assertEquals("ZZZZ", miss.get(0).values().get(0));
+      assertNull(miss.get(0).values().get(1));
+    }
+  }
+
+  @Test
   void characterAndVarcharTypesLoadAsText() {
     try (Database db = open()) {
       db.execute(
@@ -202,6 +249,12 @@ class DialectTest {
       assertEquals("a!", db.query("SELECT name || '!' FROM t WHERE id = 1").get(0).values().get(0));
       assertNull(db.query("SELECT name || '!' FROM t WHERE id = 2").get(0).values().get(0));
       assertEquals("x", db.query("SELECT IFNULL(name, 'x') FROM t WHERE id = 2").get(0).values().get(0));
+      assertEquals("x", db.query("SELECT ISNULL(name, 'x') FROM t WHERE id = 2").get(0).values().get(0));
+      assertEquals("a", db.query("SELECT ISNULL(name, 'x') FROM t WHERE id = 1").get(0).values().get(0));
+      assertNull(db.query("SELECT NULLIF(name, 'a') FROM t WHERE id = 1").get(0).values().get(0));
+      assertEquals("a", db.query("SELECT NULLIF(name, '') FROM t WHERE id = 1").get(0).values().get(0));
+      assertEquals("kept", db.query("SELECT COALESCE(NULLIF('', ''), 'kept')").get(0).values().get(0));
+      assertNull(db.query("SELECT NULLIF(name, 'x') FROM t WHERE id = 2").get(0).values().get(0));
       String now = (String) db.query("SELECT datetime('now')").get(0).values().get(0);
       assertTrue(now.matches("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}"));
       assertEquals(1, db.query("SELECT 1 WHERE datetime('now') > '2020-01-01 00:00:00'").size());
@@ -209,6 +262,26 @@ class DialectTest {
       db.execute("CREATE TABLE empty (id INTEGER)");
       assertEquals(0L, db.query("SELECT COUNT(*) FROM empty").get(0).values().get(0));
       assertNull(db.query("SELECT MAX(id) FROM empty").get(0).values().get(0));
+      assertEquals(3L, db.query("SELECT SUM(id) FROM t").get(0).values().get(0));
+      assertNull(db.query("SELECT SUM(id) FROM empty").get(0).values().get(0));
+      assertEquals(0L, db.query("SELECT COALESCE(SUM(id),0) FROM empty").get(0).values().get(0));
+      assertEquals(3L, db.query("SELECT COALESCE(SUM(id),0) FROM t").get(0).values().get(0));
+    }
+  }
+
+  @Test
+  void coalesceSumWithWhereParameter() {
+    try (Database db = open()) {
+      db.execute("CREATE TABLE parsed_budget (version_id INTEGER, actual_amount INTEGER)");
+      db.execute("INSERT INTO parsed_budget VALUES (1, 10)");
+      db.execute("INSERT INTO parsed_budget VALUES (1, 20)");
+      db.execute("INSERT INTO parsed_budget VALUES (2, 99)");
+      assertEquals(30L,
+          db.query("SELECT COALESCE(SUM(actual_amount),0) FROM parsed_budget WHERE version_id=1")
+              .get(0).values().get(0));
+      assertEquals(0L,
+          db.query("SELECT COALESCE(SUM(actual_amount),0) FROM parsed_budget WHERE version_id=9")
+              .get(0).values().get(0));
     }
   }
 
@@ -403,6 +476,138 @@ class DialectTest {
       assertEquals("alice", page.get(0).values().get(1));
       assertEquals("u2", page.get(1).values().get(0));
       assertEquals("", page.get(1).values().get(1));
+    }
+  }
+
+  @Test
+  void outerApplyKeepsLatestRateAndUnmatchedRows() {
+    try (Database db = open()) {
+      db.execute("CREATE TABLE sales (company TEXT, code TEXT, name TEXT)");
+      db.execute("CREATE TABLE rate (company TEXT, code TEXT, pct INTEGER, effective TEXT)");
+      db.execute("INSERT INTO sales (company, code, name) VALUES ('ELCSS', 'GST', 'Goods')");
+      db.execute("INSERT INTO sales (company, code, name) VALUES ('ELCSS', 'NONE', 'Missing')");
+      db.execute("INSERT INTO sales (company, code, name) VALUES ('OTHER', 'GST', 'Skip')");
+      db.execute("INSERT INTO rate (company, code, pct, effective) VALUES ('ELCSS', 'GST', 5, '2020-01-01')");
+      db.execute("INSERT INTO rate (company, code, pct, effective) VALUES ('ELCSS', 'GST', 8, '2024-01-01')");
+      db.execute("INSERT INTO rate (company, code, pct, effective) VALUES ('ELCSS', 'GST', 3, '2022-01-01')");
+      List<Row> rows = db.query(
+          """
+          SELECT t.code, r.pct, r.effective
+          FROM sales t
+          OUTER APPLY (
+            SELECT TOP 1 pct, effective
+            FROM rate tr
+            WHERE tr.company = t.company AND tr.code = t.code
+            ORDER BY tr.effective DESC
+          ) r
+          WHERE t.company = 'ELCSS'
+          ORDER BY t.code
+          """);
+      assertEquals(2, rows.size());
+      assertEquals(List.of("code", "pct", "effective"), rows.get(0).columns());
+      assertEquals("GST", rows.get(0).values().get(0));
+      assertEquals(8L, rows.get(0).values().get(1));
+      assertEquals("2024-01-01", rows.get(0).values().get(2));
+      assertEquals("NONE", rows.get(1).values().get(0));
+      assertNull(rows.get(1).values().get(1));
+      assertNull(rows.get(1).values().get(2));
+
+      List<Row> crossed = db.query(
+          """
+          SELECT t.code, r.pct
+          FROM sales t
+          CROSS APPLY (
+            SELECT TOP 1 pct
+            FROM rate tr
+            WHERE tr.company = t.company AND tr.code = t.code
+            ORDER BY tr.effective DESC
+          ) r
+          WHERE t.company = 'ELCSS'
+          ORDER BY t.code
+          """);
+      assertEquals(1, crossed.size());
+      assertEquals("GST", crossed.get(0).values().get(0));
+      assertEquals(8L, crossed.get(0).values().get(1));
+    }
+  }
+
+  @Test
+  void unionAllCastAndNotExists() {
+    try (Database db = open()) {
+      db.execute(
+          "CREATE TABLE header (company TEXT, tax TEXT, rate TEXT, description TEXT, defaultRate INTEGER, textCode TEXT)");
+      db.execute("CREATE TABLE rates (company TEXT, tax TEXT, rate TEXT)");
+      db.execute(
+          "INSERT INTO header (company, tax, rate, description, defaultRate, textCode) VALUES ('ELCSS', 'GST', 'A', 'header', 1, 'note')");
+      db.execute("INSERT INTO rates (company, tax, rate) VALUES ('ELCSS', 'GST', 'A')");
+      db.execute("INSERT INTO rates (company, tax, rate) VALUES ('ELCSS', 'GST', 'B')");
+      db.execute("INSERT INTO rates (company, tax, rate) VALUES ('ELCSS', 'GST', 'B')");
+      db.execute("INSERT INTO rates (company, tax, rate) VALUES ('OTHER', 'GST', 'C')");
+      List<Row> rows = db.query(
+          """
+          SELECT rate, description, defaultRate, textCode, 1 AS HasHeader
+          FROM header
+          WHERE company = ? AND tax = ?
+          UNION ALL
+          SELECT DISTINCT tr.rate, tr.rate, CAST(0 AS bit), CAST('' AS nvarchar(10)), 0
+          FROM rates tr
+          WHERE tr.company = ? AND tr.tax = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM header s
+            WHERE s.company = tr.company AND s.tax = tr.tax AND s.rate = tr.rate
+          )
+          ORDER BY rate
+          """,
+          "ELCSS",
+          "GST",
+          "ELCSS",
+          "GST");
+      assertEquals(2, rows.size());
+      assertEquals(List.of("rate", "description", "defaultRate", "textCode", "HasHeader"), rows.get(0).columns());
+      assertEquals(List.of("A", "header", 1L, "note", 1L), rows.get(0).values());
+      assertEquals(List.of("B", "B", 0L, "", 0L), rows.get(1).values());
+
+      List<Row> distinct = db.query(
+          """
+          SELECT rate FROM header WHERE company = 'ELCSS'
+          UNION
+          SELECT rate FROM rates WHERE company = 'ELCSS'
+          ORDER BY rate
+          """);
+      assertEquals(List.of("A", "B"), values(distinct));
+    }
+  }
+
+  @Test
+  void groupedSumAbsAndHaving() {
+    try (Database db = open()) {
+      db.execute("CREATE TABLE bal (company TEXT, code TEXT, name TEXT, debit INTEGER, credit INTEGER)");
+      db.execute("CREATE TABLE acct (company TEXT, code TEXT, accountDesc TEXT)");
+      db.execute("INSERT INTO bal (company, code, name, debit, credit) VALUES ('ELCSS', '1000', 'cash', -4, 0)");
+      db.execute("INSERT INTO bal (company, code, name, debit, credit) VALUES ('ELCSS', '1000', 'cash', 6, 1)");
+      db.execute("INSERT INTO bal (company, code, name, debit, credit) VALUES ('ELCSS', '2000', 'zero', 0, NULL)");
+      db.execute("INSERT INTO bal (company, code, name, debit, credit) VALUES ('OTHER', '1000', 'skip', 9, 9)");
+      db.execute("INSERT INTO acct (company, code, accountDesc) VALUES ('ELCSS', '1000', 'Cash')");
+      List<Row> rows = db.query(
+          """
+          SELECT p.code AS GLAccount, MAX(a.accountDesc) AS AccountName,
+                 SUM(ABS(ISNULL(p.debit, 0))) AS DebitAmt,
+                 SUM(ABS(ISNULL(p.credit, 0))) AS CreditAmt
+          FROM bal p
+          LEFT JOIN acct a ON a.company = p.company AND a.code = p.code
+          WHERE p.company = ? AND p.code <= ?
+          GROUP BY p.code
+          HAVING SUM(ABS(ISNULL(p.debit, 0))) <> 0 OR SUM(ABS(ISNULL(p.credit, 0))) <> 0
+          ORDER BY p.code
+          """,
+          "ELCSS",
+          "9999");
+      assertEquals(1, rows.size());
+      assertEquals(List.of("GLAccount", "AccountName", "DebitAmt", "CreditAmt"), rows.get(0).columns());
+      assertEquals("1000", rows.get(0).values().get(0));
+      assertEquals("Cash", rows.get(0).values().get(1));
+      assertEquals(10L, rows.get(0).values().get(2));
+      assertEquals(1L, rows.get(0).values().get(3));
     }
   }
 

@@ -51,11 +51,12 @@ public final class RecordCodec {
           body.write((int) (bits >>> shift) & 0xff);
         }
       } else if (value instanceof String text) {
+        // SQLite: TEXT = N*2+13 (odd), BLOB = N*2+12 (even)
         byte[] raw = text.getBytes(StandardCharsets.UTF_8);
-        types.writeBytes(putVarint(raw.length * 2L + 12));
+        types.writeBytes(putVarint(raw.length * 2L + 13));
         body.writeBytes(raw);
       } else if (value instanceof byte[] raw) {
-        types.writeBytes(putVarint(raw.length * 2L + 13));
+        types.writeBytes(putVarint(raw.length * 2L + 12));
         body.writeBytes(raw);
       } else {
         throw new SqlException("unsupported record value");
@@ -127,10 +128,10 @@ public final class RecordCodec {
       value = readInteger(payload, cursor[0], length);
     } else if (serial == 7) {
       value = readReal(payload, cursor[0]);
-    } else if (serial >= 13 && serial % 2 == 1) {
-      value = java.util.Arrays.copyOfRange(payload, cursor[0], cursor[0] + length);
-    } else {
+    } else if (serial >= 13 && (serial & 1) == 1) {
       value = new String(payload, cursor[0], length, StandardCharsets.UTF_8);
+    } else {
+      value = java.util.Arrays.copyOfRange(payload, cursor[0], cursor[0] + length);
     }
     cursor[0] += length;
     return value;

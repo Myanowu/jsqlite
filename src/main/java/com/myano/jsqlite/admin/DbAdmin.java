@@ -24,9 +24,14 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import javax.swing.AbstractAction;
 import javax.swing.BorderFactory;
@@ -65,6 +70,9 @@ import javax.swing.tree.DefaultTreeModel;
 import javax.swing.tree.TreePath;
 
 public final class DbAdmin {
+  /** 「全部」超過此行數時二次確認，避免大表一次載入打爆記憶體。 */
+  static final int ALL_ROW_CONFIRM = 100_000;
+
   private static final Color ERROR = Brand.ERROR;
   private static final Color NORMAL = Brand.INK;
 
@@ -168,10 +176,10 @@ public final class DbAdmin {
 
     tree.setRootVisible(true);
     tree.setShowsRootHandles(true);
-    tree.setRowHeight(28);
-    tree.setFont(uiFont());
+    tree.setRowHeight(22);
+    tree.setFont(listFont());
     tree.setBackground(Brand.SURFACE);
-    tree.setBorder(BorderFactory.createEmptyBorder(4, 2, 4, 2));
+    tree.setBorder(BorderFactory.createEmptyBorder(2, 2, 2, 2));
     tree.setCellRenderer(new SchemaTreeRenderer());
     tree.addTreeSelectionListener(onTreeSelect);
     tree.addTreeExpansionListener(new TreeExpansionListener() {
@@ -198,15 +206,15 @@ public final class DbAdmin {
     });
 
     grid.setFillsViewportHeight(true);
-    grid.setRowHeight(28);
-    grid.setFont(uiFont());
+    grid.setRowHeight(22);
+    grid.setFont(listFont());
     grid.setBackground(Brand.SURFACE);
     grid.setSelectionBackground(Brand.SELECT);
     grid.setSelectionForeground(Brand.INK);
     grid.setShowHorizontalLines(false);
     grid.setShowVerticalLines(false);
     grid.setIntercellSpacing(new Dimension(0, 0));
-    grid.getTableHeader().setFont(uiFont().deriveFont(Font.BOLD));
+    grid.getTableHeader().setFont(listFont().deriveFont(Font.BOLD));
     grid.getTableHeader().setBackground(Brand.ZEBRA);
     grid.getTableHeader().setForeground(Brand.INK);
     grid.getTableHeader().setDefaultRenderer(new HeaderRenderer());
@@ -303,7 +311,14 @@ public final class DbAdmin {
       if (syncingLimit || gridTable == null || selectedColumn() != null) {
         return;
       }
-      rowLimit = limitValue(tableLimit);
+      int next = limitValue(tableLimit);
+      if (next == 0 && !confirmLoadAll(gridTable)) {
+        syncingLimit = true;
+        tableLimit.setSelectedItem(rowLimit == 0 ? "全部" : Integer.toString(rowLimit));
+        syncingLimit = false;
+        return;
+      }
+      rowLimit = next;
       editor.setText(browseSql(gridTable));
       editor.setCaretPosition(0);
       showTable(gridTable);
@@ -399,10 +414,7 @@ public final class DbAdmin {
     syncChrome();
     rebuildTree(null);
     clearGrid();
-    String note = session.readOnly()
-        ? "。資料先放在記憶體裡，插入、修改和刪除不會寫回這個檔。"
-        : "。";
-    setStatus("已打開 " + path + "，" + visibleTables().size() + " 個資料表" + note, false);
+    setStatus(openStatus(path), false);
   }
 
   private void createTable() {
@@ -705,6 +717,66 @@ public final class DbAdmin {
     return table.rowCount();
   }
 
+  private String openStatus(Path path) {
+    String note = session.readOnly()
+        ? "。資料先放在記憶體裡，插入、修改和刪除不會寫回這個檔。"
+        : "。";
+    List<TableInfo> tables = visibleTables();
+    int maxRows = 0;
+    for (TableInfo table : tables) {
+      maxRows = Math.max(maxRows, table.rowCount());
+    }
+    String size = "?";
+    try {
+      if (Files.isRegularFile(path)) {
+        size = formatBytes(Files.size(path));
+      }
+    } catch (IOException ignored) {
+      size = "?";
+    }
+    return "已打開 "
+        + path
+        + " · "
+        + size
+        + " · "
+        + tables.size()
+        + " 個資料表 · 最大表 "
+        + maxRows
+        + " 列"
+        + note;
+  }
+
+  private boolean confirmLoadAll(TableInfo table) {
+    int total = tableCount(table);
+    if (total <= ALL_ROW_CONFIRM) {
+      return true;
+    }
+    int choice = JOptionPane.showConfirmDialog(
+        frame,
+        table.name()
+            + " 有 "
+            + total
+            + " 列。載入全部可能佔用大量記憶體。仍要繼續嗎？",
+        "顯示全部",
+        JOptionPane.YES_NO_OPTION,
+        JOptionPane.WARNING_MESSAGE);
+    return choice == JOptionPane.YES_OPTION;
+  }
+
+  public static String formatBytes(long bytes) {
+    if (bytes < 1024) {
+      return bytes + " B";
+    }
+    double value = bytes;
+    String[] units = {"KB", "MB", "GB", "TB"};
+    int unit = -1;
+    while (value >= 1024 && unit + 1 < units.length) {
+      value /= 1024;
+      unit++;
+    }
+    return String.format(Locale.ROOT, "%.1f %s", value, units[unit]);
+  }
+
   private static int limitValue(JComboBox<String> box) {
     Object item = box.getSelectedItem();
     if (item == null || "全部".equals(item.toString())) {
@@ -749,10 +821,10 @@ public final class DbAdmin {
   private JPanel columnHeading(TableInfo table, Column column) {
     JLabel mark = new JLabel(column.type() == ColumnType.INTEGER ? SchemaIcons.INTEGER : SchemaIcons.TEXT);
     JLabel name = new JLabel(column.name());
-    name.setFont(uiFont().deriveFont(Font.BOLD, 18f));
+    name.setFont(uiFont(15f, Font.BOLD));
     name.setForeground(Brand.INK);
     JLabel meta = new JLabel(table.name() + "  ·  " + column.type().name());
-    meta.setFont(uiFont().deriveFont(12f));
+    meta.setFont(uiFont(11f, Font.PLAIN));
     meta.setForeground(Brand.MUTED);
     JPanel lines = new JPanel(new BorderLayout(0, 2));
     lines.setOpaque(false);
@@ -783,8 +855,8 @@ public final class DbAdmin {
     model.addRow(new Object[] {"預設值", defaultText(column)});
     model.addRow(new Object[] {"索引", indexText(table, column)});
     JTable props = new JTable(model);
-    props.setFont(uiFont());
-    props.setRowHeight(28);
+    props.setFont(listFont());
+    props.setRowHeight(22);
     props.setBackground(Brand.SURFACE);
     props.setShowVerticalLines(false);
     props.setGridColor(Brand.LINE);
@@ -877,6 +949,12 @@ public final class DbAdmin {
       if (next == rowLimit) {
         return;
       }
+      if (next == 0 && gridTable != null && !confirmLoadAll(gridTable)) {
+        syncingLimit = true;
+        limit.setSelectedItem(rowLimit == 0 ? "全部" : Integer.toString(rowLimit));
+        syncingLimit = false;
+        return;
+      }
       rowLimit = next;
       syncingLimit = true;
       tableLimit.setSelectedItem(limit.getSelectedItem());
@@ -956,8 +1034,8 @@ public final class DbAdmin {
         return component;
       }
     };
-    data.setFont(uiFont());
-    data.setRowHeight(28);
+    data.setFont(listFont());
+    data.setRowHeight(22);
     data.setBackground(Brand.SURFACE);
     data.setSelectionBackground(Brand.SELECT);
     data.setSelectionForeground(Brand.INK);
@@ -1285,6 +1363,7 @@ public final class DbAdmin {
         shown.add(table);
       }
     }
+    shown.sort(Comparator.comparing(TableInfo::name, String.CASE_INSENSITIVE_ORDER));
     return shown;
   }
 
@@ -1421,11 +1500,12 @@ public final class DbAdmin {
       // 系統外觀不可用時沿用 Swing 預設。
     }
     Font ui = uiFont();
+    Font list = listFont();
     UIManager.put("Button.font", ui);
     UIManager.put("Label.font", ui);
-    UIManager.put("Tree.font", ui);
-    UIManager.put("Table.font", ui);
-    UIManager.put("TableHeader.font", ui);
+    UIManager.put("Tree.font", list);
+    UIManager.put("Table.font", list);
+    UIManager.put("TableHeader.font", list.deriveFont(Font.BOLD));
     UIManager.put("TextField.font", ui);
     UIManager.put("TextArea.font", ui);
     UIManager.put("ComboBox.font", ui);
@@ -1440,21 +1520,31 @@ public final class DbAdmin {
     UIManager.put("MenuItem.font", ui);
   }
 
+  /** 工具列、按鈕、標籤：略密於系統預設，仍保持可點。 */
   private static Font uiFont() {
-    Font font = new Font("Microsoft JhengHei UI", Font.PLAIN, 14);
-    if ("Microsoft JhengHei UI".equals(font.getFamily())) {
-      return font;
+    return uiFont(12.5f, Font.PLAIN);
+  }
+
+  /** 左側物件樹與資料格：再小一號，接近 DBeaver / DataGrip 密度。 */
+  private static Font listFont() {
+    return uiFont(12f, Font.PLAIN);
+  }
+
+  private static Font uiFont(float size, int style) {
+    Font font = new Font("Microsoft JhengHei UI", style, Math.round(size));
+    if (!"Microsoft JhengHei UI".equalsIgnoreCase(font.getFamily())) {
+      font = new Font(Font.DIALOG, style, Math.round(size));
     }
-    return new Font(Font.DIALOG, Font.PLAIN, 14);
+    return font.deriveFont(style, size);
   }
 
   private JPanel brandBar() {
     JLabel mark = new JLabel(Brand.icon(40));
     JLabel title = new JLabel("JSQLite");
-    title.setFont(uiFont().deriveFont(Font.BOLD, 20f));
+    title.setFont(uiFont(18f, Font.BOLD));
     title.setForeground(Brand.INK);
     JLabel subtitle = new JLabel("資料庫");
-    subtitle.setFont(uiFont().deriveFont(12f));
+    subtitle.setFont(uiFont(11f, Font.PLAIN));
     subtitle.setForeground(Brand.MUTED);
     JPanel names = new JPanel(new BorderLayout());
     names.setOpaque(false);
@@ -1485,11 +1575,11 @@ public final class DbAdmin {
   }
 
   private static Font sqlFont() {
-    Font font = new Font("Consolas", Font.PLAIN, 15);
-    if ("Consolas".equals(font.getFamily())) {
+    Font font = new Font("Consolas", Font.PLAIN, 13);
+    if ("Consolas".equalsIgnoreCase(font.getFamily())) {
       return font;
     }
-    return new Font(Font.MONOSPACED, Font.PLAIN, 15);
+    return new Font(Font.MONOSPACED, Font.PLAIN, 13);
   }
 
   private record TableNode(TableInfo table) {
@@ -1513,7 +1603,7 @@ public final class DbAdmin {
       java.awt.Component component = super.getTableCellRendererComponent(table, value, selected, focus, row, column);
       String text = value == null ? "NULL" : String.valueOf(value);
       setToolTipText(text.length() > 500 ? text.substring(0, 500) : text);
-      setBorder(BorderFactory.createEmptyBorder(0, 8, 0, 8));
+      setBorder(BorderFactory.createEmptyBorder(0, 6, 0, 6));
       if (value == null) {
         setText("NULL");
         if (!selected) {
@@ -1533,7 +1623,8 @@ public final class DbAdmin {
       setBorderSelectionColor(Brand.TEAL);
       setBackgroundNonSelectionColor(Brand.SURFACE);
       setTextNonSelectionColor(Brand.INK);
-      setIconTextGap(6);
+      setIconTextGap(5);
+      setFont(listFont());
     }
 
     @Override
@@ -1560,13 +1651,13 @@ public final class DbAdmin {
         JTable table, Object value, boolean selected, boolean focus, int row, int column) {
       super.getTableCellRendererComponent(table, value, selected, focus, row, column);
       setText(value == null ? "" : String.valueOf(value));
-      setFont(uiFont().deriveFont(Font.BOLD));
+      setFont(listFont().deriveFont(Font.BOLD));
       setBackground(Brand.ZEBRA);
       setForeground(Brand.INK);
       setHorizontalAlignment(LEFT);
       setBorder(BorderFactory.createCompoundBorder(
           BorderFactory.createMatteBorder(0, 0, 1, 0, Brand.LINE),
-          BorderFactory.createEmptyBorder(6, 8, 6, 8)));
+          BorderFactory.createEmptyBorder(4, 8, 4, 8)));
       return this;
     }
   }

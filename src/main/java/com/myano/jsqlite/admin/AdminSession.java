@@ -4,6 +4,7 @@ import com.myano.jsqlite.Database;
 import com.myano.jsqlite.Row;
 import com.myano.jsqlite.SqlException;
 import com.myano.jsqlite.format.SqliteReader;
+import com.myano.jsqlite.sql.Ast.Compound;
 import com.myano.jsqlite.sql.Ast.Join;
 import com.myano.jsqlite.sql.Ast.Select;
 import com.myano.jsqlite.sql.Ast.SelectItem;
@@ -118,9 +119,12 @@ public final class AdminSession implements AutoCloseable {
       throw new SqlException("empty SQL");
     }
     Statement statement = parser.parse(sql);
-    if (statement instanceof Select select) {
+    if (statement instanceof Select || statement instanceof Compound) {
       List<Row> rows = current.query(sql);
-      List<String> columns = rows.isEmpty() ? outputColumns(current, select) : rows.get(0).columns();
+      Select heading = statement instanceof Select select
+          ? select
+          : ((Compound) statement).arms().get(0);
+      List<String> columns = rows.isEmpty() ? outputColumns(current, heading) : rows.get(0).columns();
       return ScriptResult.query(columns, rows);
     }
     current.execute(sql);

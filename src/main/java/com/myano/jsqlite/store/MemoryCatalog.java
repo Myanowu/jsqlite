@@ -17,6 +17,9 @@ public final class MemoryCatalog {
   private final List<IndexDef> indexes = new ArrayList<>();
   private Snapshot statementSnapshot;
   private Snapshot transactionSnapshot;
+  private boolean inTransaction;
+  /** Skip full catalog snapshots; ROLLBACK becomes a no-op (import / bulk load). */
+  private boolean bulkLoad;
   private boolean enforceForeignKeys;
   private int changes;
   private Long generatedKey;
@@ -352,7 +355,9 @@ public final class MemoryCatalog {
       for (int index : table.primaryKey()) {
         primaryKey.add(columns.get(index).name());
       }
-      snapshot.add(new TableInfo(table.name(), columns, table.rowCount(), table.sql(), primaryKey));
+      // Keep deferred tables at 0 so listing schema does not load every btree into heap.
+      int rows = table.hasDeferredLoad() ? 0 : table.rowCount();
+      snapshot.add(new TableInfo(table.name(), columns, rows, table.sql(), primaryKey));
     }
     return List.copyOf(snapshot);
   }
@@ -411,31 +416,49 @@ public final class MemoryCatalog {
     rejectDanglingParent(table, previous, null);
   }
 
+  public void setBulkLoad(boolean bulkLoad) {
+    this.bulkLoad = bulkLoad;
+  }
+
+  public boolean bulkLoad() {
+    return bulkLoad;
+  }
+
   public void beginTransaction() {
-    if (transactionSnapshot == null) {
+    if (inTransaction) {
+      return;
+    }
+    inTransaction = true;
+    if (!bulkLoad && transactionSnapshot == null) {
       transactionSnapshot = capture();
     }
   }
 
   public void commitTransaction() {
     transactionSnapshot = null;
+    inTransaction = false;
   }
 
   public void rollbackTransaction() {
-    if (transactionSnapshot == null) {
-      statementSnapshot = null;
-      return;
+    if (transactionSnapshot != null) {
+      restore(transactionSnapshot);
     }
-    restore(transactionSnapshot);
     transactionSnapshot = null;
     statementSnapshot = null;
+    inTransaction = false;
   }
 
   public boolean transactionOpen() {
-    return transactionSnapshot != null;
+    return inTransaction;
   }
 
   public void beginStatement() {
+    // Explicit transactions already protect ROLLBACK (or bulk_load skips snapshots).
+    // Re-copying every table on each statement makes bulk INSERT O(n²).
+    if (inTransaction) {
+      statementSnapshot = null;
+      return;
+    }
     statementSnapshot = capture();
   }
 

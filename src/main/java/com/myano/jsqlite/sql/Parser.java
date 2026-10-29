@@ -38,6 +38,7 @@ import com.myano.jsqlite.sql.Ast.SelectItem;
 import com.myano.jsqlite.sql.Ast.Star;
 import com.myano.jsqlite.sql.Ast.Statement;
 import com.myano.jsqlite.sql.Ast.StringLiteral;
+import com.myano.jsqlite.sql.Ast.SumExpr;
 import com.myano.jsqlite.sql.Ast.Update;
 import com.myano.jsqlite.sql.Ast.Upsert;
 import com.myano.jsqlite.store.Column;
@@ -82,7 +83,7 @@ public final class Parser {
         case ALTER -> parseAlter();
         case DROP -> parseDrop();
         case INSERT -> parseInsert();
-        case SELECT -> parseSelect();
+        case SELECT -> parseQuery();
         case UPDATE -> parseUpdate();
         case DELETE -> parseDelete();
         case PRAGMA -> parsePragma();
@@ -428,9 +429,60 @@ public final class Parser {
       return new Insert(table, columns, values, orIgnore, upsert);
     }
 
+    private Statement parseQuery() {
+      Select first = (Select) parseSelect();
+      if (peek().type() != TokenType.UNION) {
+        return first;
+      }
+      if (hasResultTail(first)) {
+        throw syntax("ORDER BY or TOP must follow the last SELECT of a UNION");
+      }
+      List<Select> arms = new ArrayList<>();
+      List<Boolean> unionAll = new ArrayList<>();
+      arms.add(first);
+      while (match(TokenType.UNION)) {
+        unionAll.add(match(TokenType.ALL));
+        Select next = (Select) parseSelect();
+        if (peek().type() == TokenType.UNION) {
+          if (hasResultTail(next)) {
+            throw syntax("ORDER BY or TOP must follow the last SELECT of a UNION");
+          }
+          arms.add(next);
+          continue;
+        }
+        arms.add(withoutResultTail(next));
+        return new Ast.Compound(arms, unionAll, next.orderBy(), next.limit(), next.offset());
+      }
+      throw syntax("expected SELECT after UNION");
+    }
+
+    private boolean hasResultTail(Select select) {
+      return !select.orderBy().isEmpty() || select.limit() != null || select.offset() != null;
+    }
+
+    private Select withoutResultTail(Select select) {
+      if (!hasResultTail(select)) {
+        return select;
+      }
+      return new Select(
+          select.distinct(),
+          select.items(),
+          select.table(),
+          select.fromSelect(),
+          select.alias(),
+          select.joins(),
+          select.where(),
+          List.of(),
+          null,
+          null,
+          select.groupBy(),
+          select.having());
+    }
+
     private Statement parseSelect() {
       expect(TokenType.SELECT);
       boolean distinct = match(TokenType.DISTINCT);
+      Expr top = parseTop();
       List<SelectItem> items = new ArrayList<>();
       items.add(parseSelectItem());
       while (match(TokenType.COMMA)) {
@@ -470,6 +522,10 @@ public final class Parser {
           groupBy.add(parseExpr());
         }
       }
+      Bool having = null;
+      if (match(TokenType.HAVING)) {
+        having = parseCondition();
+      }
       List<OrderItem> orderBy = new ArrayList<>();
       if (match(TokenType.ORDER)) {
         expect(TokenType.BY);
@@ -490,9 +546,15 @@ public final class Parser {
           offset = parseLimit();
         }
       }
+      if (top != null) {
+        if (limit != null) {
+          throw syntax("TOP cannot be combined with LIMIT");
+        }
+        limit = top;
+      }
       skipForUpdate();
       return new Select(
-          distinct, items, table, fromSelect, alias, joins, where, orderBy, limit, offset, groupBy);
+          distinct, items, table, fromSelect, alias, joins, where, orderBy, limit, offset, groupBy, having);
     }
 
     private boolean isJoin() {
@@ -500,10 +562,27 @@ public final class Parser {
       return type == TokenType.JOIN
           || type == TokenType.INNER
           || type == TokenType.LEFT
-          || type == TokenType.CROSS;
+          || type == TokenType.CROSS
+          || type == TokenType.OUTER;
     }
 
     private Join parseJoin() {
+      if (peek().type() == TokenType.OUTER
+          || (peek().type() == TokenType.CROSS && nextIs(TokenType.APPLY))) {
+        boolean outer = match(TokenType.OUTER);
+        if (!outer) {
+          match(TokenType.CROSS);
+        }
+        expect(TokenType.APPLY);
+        expect(TokenType.LPAREN);
+        Select subquery = (Select) parseSelect();
+        expect(TokenType.RPAREN);
+        String alias = parseOptionalAlias();
+        if (alias == null) {
+          throw syntax("APPLY needs an alias");
+        }
+        return new Join(outer, null, alias, null, subquery);
+      }
       if (match(TokenType.CROSS)) {
         expect(TokenType.JOIN);
         String table = parseTableName();
@@ -550,15 +629,25 @@ public final class Parser {
       if (peek().type() == TokenType.MAX && nextIs(TokenType.LPAREN)) {
         advance();
         expect(TokenType.LPAREN);
+        String qualifier = null;
         String column = expectName();
         if (match(TokenType.DOT)) {
+          qualifier = column;
           column = expectName();
           if (match(TokenType.DOT)) {
+            qualifier = column;
             column = expectName();
           }
         }
         expect(TokenType.RPAREN);
-        return new MaxItem(column, parseOptionalAlias());
+        return new MaxItem(column, parseOptionalAlias(), qualifier);
+      }
+      if (peek().type() == TokenType.SUM && nextIs(TokenType.LPAREN)) {
+        advance();
+        expect(TokenType.LPAREN);
+        Expr arg = parseExpr();
+        expect(TokenType.RPAREN);
+        return new ExpressionItem(new SumExpr(arg), parseOptionalAlias());
       }
       return new ExpressionItem(parseExpr(), parseOptionalAlias());
     }
@@ -572,6 +661,19 @@ public final class Parser {
         match(TokenType.ASC);
       }
       return new OrderItem(expr, descending);
+    }
+
+    /** SQL Server {@code SELECT TOP n} / {@code TOP (n)}, stored as the select limit. */
+    private Expr parseTop() {
+      if (!match(TokenType.TOP)) {
+        return null;
+      }
+      if (match(TokenType.LPAREN)) {
+        Expr count = parseExpr();
+        expect(TokenType.RPAREN);
+        return count;
+      }
+      return parseLimit();
     }
 
     private Expr parseLimit() {
@@ -635,7 +737,13 @@ public final class Parser {
 
     private Bool parsePredicate() {
       if (match(TokenType.NOT)) {
+        if (peek().type() == TokenType.EXISTS) {
+          return new Not(parseExists());
+        }
         return new Not(parsePredicate());
+      }
+      if (peek().type() == TokenType.EXISTS) {
+        return parseExists();
       }
       if (match(TokenType.LPAREN)) {
         Bool nested = parseCondition();
@@ -680,6 +788,14 @@ public final class Parser {
         return new Pred(new Like(left, pattern, escape));
       }
       return new Pred(new Compare(left, parseCompareOp(), parseExpr()));
+    }
+
+    private Bool parseExists() {
+      expect(TokenType.EXISTS);
+      expect(TokenType.LPAREN);
+      Select subquery = (Select) parseSelect();
+      expect(TokenType.RPAREN);
+      return new Pred(new Ast.Exists(subquery));
     }
 
     private Bool parseInList(Expr left, boolean not) {
@@ -753,7 +869,23 @@ public final class Parser {
           || peek().type() == TokenType.NULL) {
         return new LiteralExpr(parseLiteral());
       }
-      if (match(TokenType.IFNULL)) {
+      if (match(TokenType.CASE)) {
+        return parseCase();
+      }
+      if (match(TokenType.CAST)) {
+        return parseCast();
+      }
+      if (match(TokenType.LPAREN)) {
+        if (peek().type() == TokenType.SELECT) {
+          Select subquery = (Select) parseSelect();
+          expect(TokenType.RPAREN);
+          return new Ast.ScalarSubquery(subquery);
+        }
+        Expr nested = parseExpr();
+        expect(TokenType.RPAREN);
+        return nested;
+      }
+      if (match(TokenType.IFNULL) || match(TokenType.ISNULL)) {
         expect(TokenType.LPAREN);
         Expr value = parseExpr();
         expect(TokenType.COMMA);
@@ -771,6 +903,33 @@ public final class Parser {
         }
         expect(TokenType.RPAREN);
         return result;
+      }
+      if (match(TokenType.NULLIF)) {
+        expect(TokenType.LPAREN);
+        Expr value = parseExpr();
+        expect(TokenType.COMMA);
+        Expr other = parseExpr();
+        expect(TokenType.RPAREN);
+        return new Ast.CaseExpr(
+            null,
+            List.of(
+                new Ast.CaseArm(
+                    new Pred(new Compare(value, CompareOp.EQ, other)),
+                    null,
+                    new LiteralExpr(new NullLiteral()))),
+            value);
+      }
+      if (match(TokenType.SUM)) {
+        expect(TokenType.LPAREN);
+        Expr arg = parseExpr();
+        expect(TokenType.RPAREN);
+        return new SumExpr(arg);
+      }
+      if (match(TokenType.ABS)) {
+        expect(TokenType.LPAREN);
+        Expr value = parseExpr();
+        expect(TokenType.RPAREN);
+        return new Ast.AbsExpr(value);
       }
       if (peek().type() == TokenType.DATETIME && nextIs(TokenType.LPAREN)) {
         advance();
@@ -794,6 +953,52 @@ public final class Parser {
         return new ColumnRef(null, name);
       }
       throw syntax("expected an expression");
+    }
+
+    private Expr parseCast() {
+      expect(TokenType.LPAREN);
+      Expr value = parseExpr();
+      expect(TokenType.AS);
+      String type = expectName();
+      int length = -1;
+      int scale = -1;
+      if (match(TokenType.LPAREN)) {
+        length = (int) expect(TokenType.NUMBER).number();
+        if (match(TokenType.COMMA)) {
+          scale = (int) expect(TokenType.NUMBER).number();
+        }
+        expect(TokenType.RPAREN);
+      }
+      expect(TokenType.RPAREN);
+      return new Ast.CastExpr(value, type, length, scale);
+    }
+
+    private Expr parseCase() {
+      Expr operand = null;
+      if (peek().type() != TokenType.WHEN) {
+        operand = parseExpr();
+      }
+      List<Ast.CaseArm> arms = new ArrayList<>();
+      while (match(TokenType.WHEN)) {
+        if (operand == null) {
+          Bool cond = parseCondition();
+          expect(TokenType.THEN);
+          arms.add(new Ast.CaseArm(cond, null, parseExpr()));
+        } else {
+          Expr whenValue = parseExpr();
+          expect(TokenType.THEN);
+          arms.add(new Ast.CaseArm(null, whenValue, parseExpr()));
+        }
+      }
+      if (arms.isEmpty()) {
+        throw syntax("CASE needs WHEN");
+      }
+      Expr elseExpr = null;
+      if (match(TokenType.ELSE)) {
+        elseExpr = parseExpr();
+      }
+      expect(TokenType.END);
+      return new Ast.CaseExpr(operand, arms, elseExpr);
     }
 
     private Literal parseLiteral() {

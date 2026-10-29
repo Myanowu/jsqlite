@@ -56,16 +56,31 @@ final class Brand {
 
   private static BufferedImage load() {
     try (var input = Brand.class.getResourceAsStream("logo.png")) {
-      if (input == null) {
-        throw new IllegalStateException("logo.png is missing");
+      if (input != null) {
+        BufferedImage image = ImageIO.read(input);
+        if (image != null) {
+          return image;
+        }
       }
-      BufferedImage image = ImageIO.read(input);
-      if (image == null) {
-        throw new IllegalStateException("logo.png could not be read");
-      }
-      return image;
-    } catch (IOException ex) {
-      throw new IllegalStateException("logo.png could not be read", ex);
+    } catch (IOException ignored) {
+      // Fall through to the drawn mark so a missing resource cannot kill admin.cmd.
     }
+    return drawnMark();
+  }
+
+  /** Fallback window icon when logo.png is not on the classpath. */
+  private static BufferedImage drawnMark() {
+    int size = 256;
+    BufferedImage image = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
+    Graphics2D graphics = image.createGraphics();
+    graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+    graphics.setColor(INK);
+    graphics.fillRoundRect(16, 16, size - 32, size - 32, 48, 48);
+    graphics.setColor(TEAL);
+    graphics.fillRoundRect(48, 48, size - 96, size - 96, 36, 36);
+    graphics.setColor(Color.WHITE);
+    graphics.fillOval(88, 88, 80, 80);
+    graphics.dispose();
+    return image;
   }
 }

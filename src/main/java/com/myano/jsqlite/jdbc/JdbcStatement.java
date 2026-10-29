@@ -19,6 +19,7 @@ import java.util.List;
 final class JdbcStatement {
   private final Database database;
   private final String preparedSql;
+  private final Database.Prepared prepared;
   private final boolean generatedKeys;
   private final Object[] parameters;
   private final boolean[] bound;
@@ -27,11 +28,12 @@ final class JdbcStatement {
   private boolean closed;
   private Database.Outcome outcome;
 
-  private JdbcStatement(Database database, String preparedSql, boolean generatedKeys) {
+  private JdbcStatement(Database database, Database.Prepared prepared, boolean generatedKeys) {
     this.database = database;
-    this.preparedSql = preparedSql;
+    this.prepared = prepared;
+    this.preparedSql = prepared == null ? null : prepared.sql();
     this.generatedKeys = generatedKeys;
-    int count = preparedSql == null ? 0 : parameterCount(preparedSql);
+    int count = prepared == null ? 0 : prepared.parameterCount();
     this.parameters = new Object[count];
     this.bound = new boolean[count];
   }
@@ -41,9 +43,14 @@ final class JdbcStatement {
     return JdbcProxy.create(Statement.class, statement::call);
   }
 
-  static PreparedStatement prepare(Database database, String sql, boolean generatedKeys) {
-    JdbcStatement statement = new JdbcStatement(database, sql, generatedKeys);
-    return JdbcProxy.create(PreparedStatement.class, statement::call);
+  static PreparedStatement prepare(Database database, String sql, boolean generatedKeys)
+      throws SQLException {
+    try {
+      JdbcStatement statement = new JdbcStatement(database, database.prepare(sql), generatedKeys);
+      return JdbcProxy.create(PreparedStatement.class, statement::call);
+    } catch (SqlException ex) {
+      throw new SQLException(ex.getMessage(), ex);
+    }
   }
 
   private Object call(Method method, Object[] args) throws SQLException {
@@ -132,10 +139,10 @@ final class JdbcStatement {
     if (args.length != 0) {
       throw JdbcProxy.unsupported(method);
     }
-    if (preparedSql != null) {
+    if (prepared != null) {
       int[] counts = new int[preparedBatch.size()];
       for (int i = 0; i < preparedBatch.size(); i++) {
-        outcome = database.run(preparedSql, preparedBatch.get(i));
+        outcome = database.runPrepared(prepared, preparedBatch.get(i));
         if (outcome.hasResultSet()) {
           throw new SQLException("batch statement returned a result set");
         }
@@ -191,7 +198,11 @@ final class JdbcStatement {
   }
 
   private boolean execute(Method method, Object[] args) throws SQLException {
-    outcome = database.run(sql(method, args), bindings(args));
+    if (prepared != null && args.length == 0) {
+      outcome = database.runPrepared(prepared, bindings(args));
+    } else {
+      outcome = database.run(sql(method, args), bindings(args));
+    }
     return outcome.hasResultSet();
   }
 

@@ -40,6 +40,11 @@ public final class Labels {
       case Now ignored -> "datetime('now')";
       case IfNullExpr ignored -> "IFNULL";
       case Concat ignored -> "||";
+      case Ast.CaseExpr ignored -> "CASE";
+      case Ast.ScalarSubquery ignored -> "(SELECT)";
+      case Ast.SumExpr ignored -> "SUM";
+      case Ast.CastExpr ignored -> "CAST";
+      case Ast.AbsExpr ignored -> "ABS";
     };
   }
 

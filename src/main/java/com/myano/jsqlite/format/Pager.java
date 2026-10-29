@@ -88,7 +88,9 @@ public final class Pager {
   }
 
   public void commit(byte[][] next) {
-    RollbackJournal.write(path, pages);
+    if (pages.length > 0) {
+      RollbackJournal.write(path, pages);
+    }
     pages = next;
     dirty.clear();
     for (int page = 1; page <= pages.length; page++) {
@@ -113,6 +115,19 @@ public final class Pager {
   public void replace(byte[][] image) {
     pages = image;
     dirty.clear();
+  }
+
+  /** Empty pager kept after catalog load; first durable write rebuilds pages from the catalog. */
+  public static Pager detached(Path path) {
+    return new Pager(path, new byte[0][]);
+  }
+
+  /** Hand ownership of page buffers to the caller and clear this pager. */
+  public byte[][] stealPages() {
+    byte[][] stolen = pages;
+    pages = new byte[0][];
+    dirty.clear();
+    return stolen;
   }
 
   public byte[][] copyPages() {
