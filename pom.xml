@@ -8,6 +8,7 @@
   <artifactId>jsqlite</artifactId>
   <version>0.1.0-SNAPSHOT</version>
   <name>jsqlite</name>
+  <description>Pure-Java SQLite-compatible JDBC driver.</description>
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
