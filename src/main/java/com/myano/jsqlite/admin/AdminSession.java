@@ -6,6 +6,7 @@ import com.myano.jsqlite.SqlException;
 import com.myano.jsqlite.format.SqliteReader;
 import com.myano.jsqlite.sql.Ast.Compound;
 import com.myano.jsqlite.sql.Ast.Join;
+import com.myano.jsqlite.sql.Ast.Pragma;
 import com.myano.jsqlite.sql.Ast.Select;
 import com.myano.jsqlite.sql.Ast.SelectItem;
 import com.myano.jsqlite.sql.Ast.Star;
@@ -14,6 +15,7 @@ import com.myano.jsqlite.sql.Labels;
 import com.myano.jsqlite.sql.Parser;
 import com.myano.jsqlite.store.Column;
 import com.myano.jsqlite.store.IndexDef;
+import com.myano.jsqlite.store.RatioAutoIndex;
 import com.myano.jsqlite.store.TableInfo;
 
 import java.nio.file.Path;
@@ -79,6 +81,16 @@ public final class AdminSession implements AutoCloseable {
     return require().tables();
   }
 
+  /** Live row count (file-backed tables included). Prefer this over {@link TableInfo#rowCount()}. */
+  public int rowCount(String tableName) {
+    return require().rowCount(tableName);
+  }
+
+  /** Distinct counts for ratio-index winner columns; empty when the table has none. */
+  public java.util.Map<String, Integer> ratioGroupCounts(String tableName) {
+    return require().ratioGroupCounts(tableName);
+  }
+
   public List<IndexDef> indexes() {
     return require().indexes();
   }
@@ -127,8 +139,61 @@ public final class AdminSession implements AutoCloseable {
       List<String> columns = rows.isEmpty() ? outputColumns(current, heading) : rows.get(0).columns();
       return ScriptResult.query(columns, rows);
     }
+    if (statement instanceof Pragma) {
+      Database.Outcome outcome = current.run(sql);
+      if (outcome.updateCount() < 0) {
+        return ScriptResult.query(outcome.columns(), outcome.rows());
+      }
+      return ScriptResult.executed();
+    }
     current.execute(sql);
     return ScriptResult.executed();
+  }
+
+  public String journalMode() {
+    return require().journalMode();
+  }
+
+  public long busyTimeout() {
+    return require().busyTimeout();
+  }
+
+  public boolean foreignKeys() {
+    return require().foreignKeys();
+  }
+
+  public boolean bulkLoad() {
+    return require().bulkLoad();
+  }
+
+  public long ratioMinRows() {
+    return RatioAutoIndex.minRows;
+  }
+
+  public int ratioMinRatio() {
+    return RatioAutoIndex.minRatio;
+  }
+
+  public void applySettings(
+      String journalMode,
+      long busyTimeout,
+      boolean foreignKeys,
+      boolean bulkLoad,
+      long ratioMinRows,
+      int ratioMinRatio) {
+    Database current = require();
+    // In-memory libraries start as journal_mode=memory; PRAGMA only accepts delete/wal.
+    if (journalMode != null && !"memory".equalsIgnoreCase(journalMode)) {
+      current.run("PRAGMA journal_mode=" + journalMode);
+    }
+    current.run("PRAGMA busy_timeout=" + busyTimeout);
+    current.run("PRAGMA foreign_keys=" + (foreignKeys ? "ON" : "OFF"));
+    current.run("PRAGMA bulk_load=" + (bulkLoad ? "ON" : "OFF"));
+    current.run("PRAGMA jsqlite_ratio_index(" + ratioMinRows + ")=" + ratioMinRatio);
+  }
+
+  public ScriptResult walCheckpoint(String mode) {
+    return run("PRAGMA wal_checkpoint(" + mode + ")");
   }
 
   public void closeDatabase() {

@@ -52,13 +52,20 @@ public final class Database implements AutoCloseable {
   private boolean readOnly;
   private LockFile connectionLock;
   private boolean autoCommit = true;
-  private boolean gateHeld;
+  /** NONE / READ (shared) / WRITE (exclusive). Write may span statements while {@link #uncommittedWrite}. */
+  private GateMode gateMode = GateMode.NONE;
   /**
-   * Exclusive gate is held across statements only while this connection has uncommitted writes.
+   * Exclusive write lock is held across statements only while this connection has uncommitted writes.
    * Read-only Hibernate transactions must release after each statement or connection pools deadlock.
    */
   private boolean uncommittedWrite;
   private long derivedSeq;
+
+  private enum GateMode {
+    NONE,
+    READ,
+    WRITE
+  }
 
   private Database(Engine engine) {
     this.engine = engine;
@@ -90,7 +97,7 @@ public final class Database implements AutoCloseable {
       return;
     }
     if (autoCommit) {
-      enter();
+      enterWrite();
       try {
         engine.catalog.commitTransaction();
         persist(true);
@@ -111,7 +118,7 @@ public final class Database implements AutoCloseable {
     if (autoCommit) {
       throw new SqlException("commit while auto-commit is on");
     }
-    enter();
+    enterWrite();
     try {
       engine.catalog.commitTransaction();
       persist(true);
@@ -126,7 +133,7 @@ public final class Database implements AutoCloseable {
     if (autoCommit) {
       throw new SqlException("rollback while auto-commit is on");
     }
-    enter();
+    enterWrite();
     try {
       engine.catalog.rollbackTransaction();
     } finally {
@@ -147,15 +154,24 @@ public final class Database implements AutoCloseable {
     return engine.foreignKeys;
   }
 
+  public boolean bulkLoad() {
+    return engine.catalog.bulkLoad();
+  }
+
   /** Parse/compile once for JDBC PreparedStatement; reuse via {@link #runPrepared}. */
   public Prepared prepare(String sql) {
     ensureOpen();
-    Statement statement = parser.parse(sql);
-    Program program = null;
-    if (statement instanceof Insert || statement instanceof Update || statement instanceof Delete) {
-      program = compiler.compile(statement, engine.catalog, sql);
+    enterRead();
+    try {
+      Statement statement = parser.parse(sql);
+      Program program = null;
+      if (statement instanceof Insert || statement instanceof Update || statement instanceof Delete) {
+        program = compiler.compile(statement, engine.catalog, sql);
+      }
+      return new Prepared(sql, statement, program, Parameters.count(statement));
+    } finally {
+      releaseGateAfterStatement();
     }
-    return new Prepared(sql, statement, program, Parameters.count(statement));
   }
 
   /** Execute a previously prepared DML/SELECT without re-parsing or recompiling. */
@@ -180,7 +196,11 @@ public final class Database implements AutoCloseable {
   }
 
   private Outcome executeParsed(String sql, Statement statement, Program preparedProgram, Object[] values) {
-    enter();
+    if (isReadStatement(statement)) {
+      enterRead();
+    } else {
+      enterWrite();
+    }
     try {
       if (statement instanceof Select select) {
         ensureTransaction();
@@ -224,6 +244,34 @@ public final class Database implements AutoCloseable {
     }
   }
 
+  private static boolean isReadStatement(Statement statement) {
+    if (statement instanceof Select || statement instanceof Compound) {
+      return true;
+    }
+    if (statement instanceof Pragma pragma) {
+      return isReadPragma(pragma);
+    }
+    return false;
+  }
+
+  private static boolean isReadPragma(Pragma pragma) {
+    String name = pragma.name().toLowerCase(Locale.ROOT);
+    // Mutations: setters, checkpoint, analyze, split.
+    if (pragma.value() != null
+        || "wal_checkpoint".equals(name)
+        || "jsqlite_analyze".equals(name)
+        || "jsqlite_split_table".equals(name)) {
+      return false;
+    }
+    return switch (name) {
+      case "journal_mode", "busy_timeout", "foreign_keys", "bulk_load", "freelist_count" ->
+          pragma.argument() == null;
+      case "table_info", "jsqlite_sidecars" -> true;
+      case "jsqlite_ratio_index" -> pragma.argument() == null;
+      default -> false;
+    };
+  }
+
   public boolean readOnly() {
     return readOnly;
   }
@@ -241,7 +289,7 @@ public final class Database implements AutoCloseable {
     if (Parameters.count(statement) != values.length) {
       throw new SqlException("binding count mismatch: " + SqlText.snippet(sql));
     }
-    enter();
+    enterWrite();
     try {
       if (statement instanceof com.myano.jsqlite.sql.Ast.Shutdown) {
         persist(true);
@@ -270,7 +318,7 @@ public final class Database implements AutoCloseable {
     if (Parameters.count(statement) != values.length) {
       throw new SqlException("binding count mismatch: " + SqlText.snippet(sql));
     }
-    enter();
+    enterRead();
     try {
       ensureTransaction();
       if (statement instanceof Compound compound) {
@@ -307,7 +355,7 @@ public final class Database implements AutoCloseable {
   /** 建表順序。呼叫當下的列數，之後的寫入不會改這份清單。 */
   public List<TableInfo> tables() {
     ensureOpen();
-    enter();
+    enterRead();
     try {
       return engine.catalog.tables();
     } finally {
@@ -315,9 +363,47 @@ public final class Database implements AutoCloseable {
     }
   }
 
+  /**
+   * Live row count for one table. File-backed tables walk the btree once and keep a compact offset
+   * index — unlike {@link #tables()}, this does not pretend deferred tables are empty.
+   */
+  public int rowCount(String tableName) {
+    Objects.requireNonNull(tableName, "tableName");
+    ensureOpen();
+    enterRead();
+    try {
+      Table table = engine.catalog.find(tableName);
+      if (table == null) {
+        throw new SqlException("no such table: " + tableName);
+      }
+      return table.rowCount();
+    } finally {
+      releaseGateAfterStatement();
+    }
+  }
+
+  /**
+   * Distinct-value counts for high-compression (ratio-index) columns of one table. Empty when the
+   * table has no ratio winners.
+   */
+  public java.util.Map<String, Integer> ratioGroupCounts(String tableName) {
+    Objects.requireNonNull(tableName, "tableName");
+    ensureOpen();
+    enterRead();
+    try {
+      Table table = engine.catalog.find(tableName);
+      if (table == null) {
+        throw new SqlException("no such table: " + tableName);
+      }
+      return RatioAutoIndex.groupCounts(table);
+    } finally {
+      releaseGateAfterStatement();
+    }
+  }
+
   public List<IndexDef> indexes() {
     ensureOpen();
-    enter();
+    enterRead();
     try {
       return engine.catalog.indexes();
     } finally {
@@ -336,7 +422,7 @@ public final class Database implements AutoCloseable {
     if (readOnly) {
       throw new SqlException("sqlite file is read-only: " + path);
     }
-    enter();
+    enterWrite();
     try {
       ensureTransaction();
       engine.catalog.beginStatement();
@@ -356,7 +442,7 @@ public final class Database implements AutoCloseable {
 
   public void updateRow(String tableName, List<Object> original, List<Object> values) {
     ensureOpen();
-    enter();
+    enterWrite();
     try {
       ensureTransaction();
       engine.catalog.beginStatement();
@@ -376,7 +462,7 @@ public final class Database implements AutoCloseable {
 
   public void deleteRows(String tableName, List<List<Object>> rows) {
     ensureOpen();
-    enter();
+    enterWrite();
     try {
       ensureTransaction();
       engine.catalog.beginStatement();
@@ -417,28 +503,19 @@ public final class Database implements AutoCloseable {
       try (LockFile write = LockFile.acquireWrite(path, engine.busyTimeout)) {
         WalWriter.commit(path, image);
         engine.pager.replace(image);
+        engine.notePersistedImage();
       }
       engine.releaseSidecars();
       rewriteDirtySidecars();
       engine.reattachAfterPersist();
     } else {
-      Path tmp = path.resolveSibling(path.getFileName().toString() + ".tmp");
-      try {
-        writePages(tmp, image);
-        // Close mappings before replacing files on Windows (replace while mapped → AccessDenied).
-        engine.releaseSidecars();
-        engine.releaseDataPin();
-        rewriteDirtySidecars();
-        replaceDatabaseFile(tmp, path);
-      } catch (java.io.IOException ex) {
-        throw new SqlException("unable to write " + path + ": " + ex.getMessage());
-      } finally {
-        try {
-          java.nio.file.Files.deleteIfExists(tmp);
-        } catch (java.io.IOException ignored) {
-        }
-      }
-      engine.pager.replace(image);
+      // Close mappings before rewriting the main file on Windows.
+      engine.releaseSidecars();
+      engine.releaseDataPin();
+      rewriteDirtySidecars();
+      // Rollback journal + page writes (honours failOnWrite injection).
+      engine.pager.commit(image);
+      engine.notePersistedImage();
       engine.reattachAfterPersist();
     }
   }
@@ -1062,22 +1139,55 @@ public final class Database implements AutoCloseable {
     }
   }
 
-  private void enter() {
-    if (gateHeld) {
+  private void enterRead() {
+    if (gateMode == GateMode.WRITE || gateMode == GateMode.READ) {
       return;
     }
-    if (!engine.tryEnter(engine.busyTimeout)) {
+    if (!uncommittedWrite && engine.walPossiblyStale()) {
+      // Exclusive refresh, then downgrade to a shared read lock.
+      if (!engine.tryEnterWrite(engine.busyTimeout)) {
+        throw new SqlException("database is locked");
+      }
+      try {
+        engine.refreshFromWalIfNeeded();
+        engine.downgradeWriteToRead();
+      } catch (RuntimeException ex) {
+        engine.exitWrite();
+        throw ex;
+      }
+      gateMode = GateMode.READ;
+      return;
+    }
+    if (!engine.tryEnterRead(engine.busyTimeout)) {
       throw new SqlException("database is locked");
     }
-    gateHeld = true;
+    gateMode = GateMode.READ;
+  }
+
+  private void enterWrite() {
+    if (gateMode == GateMode.WRITE) {
+      return;
+    }
+    if (gateMode == GateMode.READ) {
+      engine.exitRead();
+      gateMode = GateMode.NONE;
+    }
+    if (!engine.tryEnterWrite(engine.busyTimeout)) {
+      throw new SqlException("database is locked");
+    }
+    gateMode = GateMode.WRITE;
   }
 
   private void leave() {
-    if (!gateHeld) {
+    if (gateMode == GateMode.NONE) {
       return;
     }
-    gateHeld = false;
-    engine.exit();
+    if (gateMode == GateMode.READ) {
+      engine.exitRead();
+    } else {
+      engine.exitWrite();
+    }
+    gateMode = GateMode.NONE;
   }
 
   private static Outcome informationSchema(Select select) {

@@ -29,6 +29,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -48,7 +49,6 @@ import javax.swing.JPanel;
 import javax.swing.JPopupMenu;
 import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
-import javax.swing.JTabbedPane;
 import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.JTree;
@@ -100,6 +100,8 @@ public final class DbAdmin {
   private final JTextArea status = new JTextArea(2, 20);
   private final JButton runButton = new JButton("執行");
   private final JButton createTableButton = new JButton("新建資料表");
+  private final JButton refreshCountsButton = new JButton("刷新列數");
+  private final JButton settingsButton = new JButton("資料庫設置");
   private final JButton insertButton = new JButton("插入資料");
   private final JButton editButton = new JButton("修改資料");
   private final JButton deleteButton = new JButton("刪除所選");
@@ -117,6 +119,10 @@ public final class DbAdmin {
   private boolean syncingLimit;
   private TableInfo gridTable;
   private boolean syncingSelection;
+  /** Live counts from {@link AdminSession#rowCount}; catalog snapshots keep deferred tables at 0. */
+  private final Map<String, Integer> countCache = new HashMap<>();
+  /** Ratio-index winner column → distinct count, filled when a table node is expanded. */
+  private final Map<String, Map<String, Integer>> ratioGroupCache = new HashMap<>();
   private final TreeSelectionListener onTreeSelect = event -> inspectSelection();
 
   static {
@@ -173,6 +179,14 @@ public final class DbAdmin {
     createTableButton.setFont(uiFont());
     createTableButton.setEnabled(false);
     createTableButton.addActionListener(event -> createTable());
+    refreshCountsButton.setFont(uiFont());
+    refreshCountsButton.setEnabled(false);
+    refreshCountsButton.setToolTipText("重新統計每張表的列數並寫入快取檔");
+    refreshCountsButton.addActionListener(event -> refreshTableCounts());
+    settingsButton.setFont(uiFont());
+    settingsButton.setEnabled(false);
+    settingsButton.setToolTipText("journal_mode、busy_timeout、外鍵與高壓縮比索引門檻");
+    settingsButton.addActionListener(event -> openSettings());
 
     tree.setRootVisible(true);
     tree.setShowsRootHandles(true);
@@ -185,6 +199,11 @@ public final class DbAdmin {
     tree.addTreeExpansionListener(new TreeExpansionListener() {
       @Override
       public void treeExpanded(TreeExpansionEvent event) {
+        Object last = event.getPath().getLastPathComponent();
+        if (last instanceof DefaultMutableTreeNode node
+            && node.getUserObject() instanceof TableNode table) {
+          loadRatioGroupCounts(node, table.table());
+        }
         fitTreeWidth();
       }
 
@@ -260,6 +279,8 @@ public final class DbAdmin {
     actions.add(createButton);
     actions.add(openButton);
     actions.add(createTableButton);
+    actions.add(refreshCountsButton);
+    actions.add(settingsButton);
     actions.add(closeButton);
     JPanel north = new JPanel(new BorderLayout());
     north.setBackground(Brand.PAPER);
@@ -391,9 +412,12 @@ public final class DbAdmin {
       setStatus(ex.getMessage(), true);
       return;
     }
+    countCache.clear();
+    ratioGroupCache.clear();
     syncChrome();
     rebuildTree(null);
     clearGrid();
+    editor.setText("");
     setStatus("已建立 " + path + "。接著按「新建資料表」。", false);
   }
 
@@ -411,10 +435,22 @@ public final class DbAdmin {
       setStatus(ex.getMessage(), true);
       return;
     }
+    countCache.clear();
+    ratioGroupCache.clear();
     syncChrome();
+    List<TableInfo> tables = visibleTables();
     rebuildTree(null);
     clearGrid();
-    setStatus(openStatus(path), false);
+    editor.setText("");
+    if (loadCachedCounts(path, tables)) {
+      fitTreeWidth();
+      setStatus(openStatus(path) + "（列數來自快取）", false);
+    } else {
+      populateAllCounts(tables);
+      persistCounts();
+      fitTreeWidth();
+      setStatus(openStatus(path), false);
+    }
   }
 
   private void createTable() {
@@ -449,9 +485,12 @@ public final class DbAdmin {
 
   private void discardDatabase() {
     session.closeDatabase();
+    countCache.clear();
+    ratioGroupCache.clear();
     syncChrome();
     rebuildTree(null);
     clearGrid();
+    editor.setText(exampleSql());
     setStatus("已關閉資料庫", false);
   }
 
@@ -459,6 +498,8 @@ public final class DbAdmin {
     boolean open = session.isOpen();
     runButton.setEnabled(open);
     createTableButton.setEnabled(open);
+    refreshCountsButton.setEnabled(open);
+    settingsButton.setEnabled(open);
     updateInsertButton();
     String label = open
         ? "資料庫：" + session.path() + (session.readOnly() ? "（不寫回檔案）" : "")
@@ -466,6 +507,40 @@ public final class DbAdmin {
     databaseLabel.setForeground(open ? Brand.INK : Brand.MUTED);
     databaseLabel.setText(label);
     databaseLabel.setToolTipText(label);
+  }
+
+  private void refreshTableCounts() {
+    if (!session.isOpen()) {
+      setStatus("尚未開啟資料庫", true);
+      return;
+    }
+    List<TableInfo> tables = visibleTables();
+    countCache.clear();
+    for (TableInfo table : tables) {
+      refreshTableLabel(table.name());
+    }
+    populateAllCounts(tables);
+    persistCounts();
+    fitTreeWidth();
+    setStatus(openStatus(session.path()) + "（已刷新列數）", false);
+  }
+
+  private void openSettings() {
+    if (!session.isOpen()) {
+      setStatus("尚未開啟資料庫", true);
+      return;
+    }
+    boolean saved = new DatabaseSettingsDialog(frame, session).showDialog();
+    if (saved) {
+      setStatus(
+          "已套用設置：journal_mode="
+              + session.journalMode()
+              + " · busy_timeout="
+              + session.busyTimeout()
+              + " · foreign_keys="
+              + (session.foreignKeys() ? "ON" : "OFF"),
+          false);
+    }
   }
 
   private void updateInsertButton() {
@@ -709,12 +784,125 @@ public final class DbAdmin {
   }
 
   private int tableCount(TableInfo table) {
-    for (TableInfo item : session.tables()) {
-      if (item.name().equals(table.name())) {
-        return item.rowCount();
+    Integer cached = countCache.get(table.name());
+    if (cached != null) {
+      return cached;
+    }
+    int rows = session.rowCount(table.name());
+    countCache.put(table.name(), rows);
+    refreshTableLabel(table.name());
+    persistCounts();
+    return rows;
+  }
+
+  /** Apply {@code .admin-counts} when every visible table has an entry. */
+  private boolean loadCachedCounts(Path path, List<TableInfo> tables) {
+    Map<String, Integer> stored = AdminTableCounts.read(path);
+    if (stored == null || stored.isEmpty() || tables.isEmpty()) {
+      return false;
+    }
+    for (TableInfo table : tables) {
+      if (!stored.containsKey(table.name())) {
+        return false;
       }
     }
-    return table.rowCount();
+    for (TableInfo table : tables) {
+      countCache.put(table.name(), stored.get(table.name()));
+      refreshTableLabel(table.name());
+    }
+    return true;
+  }
+
+  /** Count every visible table so the tree shows row totals without clicking each one. */
+  private void populateAllCounts(List<TableInfo> tables) {
+    int total = tables.size();
+    for (int i = 0; i < total; i++) {
+      TableInfo table = tables.get(i);
+      setStatus("正在統計列數… " + (i + 1) + "/" + total + " · " + table.name(), false);
+      if (status.isShowing()) {
+        status.paintImmediately(0, 0, Math.max(1, status.getWidth()), Math.max(1, status.getHeight()));
+      }
+      try {
+        countCache.put(table.name(), session.rowCount(table.name()));
+        refreshTableLabel(table.name());
+      } catch (SqlException | IllegalStateException ignored) {
+        // Leave the label without a count if this table cannot be indexed yet.
+      }
+    }
+  }
+
+  private void persistCounts() {
+    if (!session.isOpen() || countCache.isEmpty()) {
+      return;
+    }
+    AdminTableCounts.write(session.path(), countCache);
+  }
+
+  private void invalidateCount(String tableName) {
+    countCache.remove(tableName);
+    ratioGroupCache.remove(tableName);
+  }
+
+  private void loadRatioGroupCounts(DefaultMutableTreeNode tableNode, TableInfo table) {
+    Map<String, Integer> cached = ratioGroupCache.get(table.name());
+    if (cached == null) {
+      setStatus("正在統計 " + table.name() + " 的高壓縮比欄位分組…", false);
+      if (status.isShowing()) {
+        status.paintImmediately(0, 0, Math.max(1, status.getWidth()), Math.max(1, status.getHeight()));
+      }
+      try {
+        cached = Map.copyOf(session.ratioGroupCounts(table.name()));
+      } catch (SqlException | IllegalStateException ex) {
+        setStatus(ex.getMessage(), true);
+        return;
+      }
+      ratioGroupCache.put(table.name(), cached);
+      if (cached.isEmpty()) {
+        setStatus(table.name() + "：沒有高壓縮比欄位統計", false);
+      } else {
+        setStatus(table.name() + "：已標示 " + cached.size() + " 個高壓縮比欄位的分組數", false);
+      }
+    }
+    applyRatioGroupLabels(tableNode, table, cached);
+  }
+
+  private void applyRatioGroupLabels(
+      DefaultMutableTreeNode tableNode, TableInfo table, Map<String, Integer> groups) {
+    if (!(tree.getModel() instanceof DefaultTreeModel model)) {
+      return;
+    }
+    for (int i = 0; i < tableNode.getChildCount(); i++) {
+      Object child = tableNode.getChildAt(i);
+      if (!(child instanceof DefaultMutableTreeNode node)
+          || !(node.getUserObject() instanceof ColumnNode column)) {
+        continue;
+      }
+      Integer groupsForColumn = groups.get(column.column().name());
+      ColumnNode updated = new ColumnNode(column.column(), groupsForColumn);
+      if (!updated.toString().equals(column.toString())) {
+        node.setUserObject(updated);
+        model.nodeChanged(node);
+      }
+    }
+  }
+
+  private void refreshTableLabel(String tableName) {
+    Object root = tree.getModel().getRoot();
+    if (!(tree.getModel() instanceof DefaultTreeModel model)) {
+      return;
+    }
+    int count = model.getChildCount(root);
+    for (int i = 0; i < count; i++) {
+      Object child = model.getChild(root, i);
+      if (child instanceof DefaultMutableTreeNode node
+          && node.getUserObject() instanceof TableNode table
+          && table.table().name().equals(tableName)) {
+        node.setUserObject(new TableNode(table.table(), countCache.get(tableName)));
+        model.nodeChanged(node);
+        fitTreeWidth();
+        return;
+      }
+    }
   }
 
   private String openStatus(Path path) {
@@ -722,9 +910,11 @@ public final class DbAdmin {
         ? "。資料先放在記憶體裡，插入、修改和刪除不會寫回這個檔。"
         : "。";
     List<TableInfo> tables = visibleTables();
-    int maxRows = 0;
-    for (TableInfo table : tables) {
-      maxRows = Math.max(maxRows, table.rowCount());
+    int maxRows = -1;
+    for (Integer rows : countCache.values()) {
+      if (rows != null) {
+        maxRows = Math.max(maxRows, rows);
+      }
     }
     String size = "?";
     try {
@@ -734,16 +924,13 @@ public final class DbAdmin {
     } catch (IOException ignored) {
       size = "?";
     }
-    return "已打開 "
-        + path
-        + " · "
-        + size
-        + " · "
-        + tables.size()
-        + " 個資料表 · 最大表 "
-        + maxRows
-        + " 列"
-        + note;
+    StringBuilder text = new StringBuilder();
+    text.append("已打開 ").append(path).append(" · ").append(size).append(" · ").append(tables.size()).append(" 個資料表");
+    if (maxRows >= 0) {
+      text.append(" · 最大表 ").append(maxRows).append(" 列");
+    }
+    text.append(note);
+    return text.toString();
   }
 
   private boolean confirmLoadAll(TableInfo table) {
@@ -790,10 +977,9 @@ public final class DbAdmin {
     List<Object> values = loadColumn(table, column);
     columnView.removeAll();
     columnView.add(columnHeading(table, column), BorderLayout.NORTH);
-    JTabbedPane tabs = new JTabbedPane();
-    tabs.setFont(uiFont());
-    tabs.addTab("欄位資訊", columnInfo(table, column));
-    tabs.addTab("此欄的值", columnValues(table, column, values));
+    SegmentedTabs tabs = new SegmentedTabs();
+    tabs.addPage("欄位資訊", columnInfo(table, column));
+    tabs.addPage("此欄的值", columnValues(table, column, values));
     columnView.add(tabs, BorderLayout.CENTER);
     resultBorder.setTitle("欄位 · " + table.name() + "." + column.name());
     rowActions.setVisible(false);
@@ -1101,6 +1287,7 @@ public final class DbAdmin {
     if (!inserted) {
       return;
     }
+    invalidateCount(table.name());
     focusTable(table.name());
     setStatus("已插入：" + written[0], false);
   }
@@ -1131,6 +1318,7 @@ public final class DbAdmin {
       if (!saved) {
         return;
       }
+      invalidateCount(table.name());
       showTable(table);
       setStatus("已修改 " + table.name() + " 的一列", false);
     } catch (RuntimeException ex) {
@@ -1164,6 +1352,7 @@ public final class DbAdmin {
     TableInfo table = gridTable;
     try {
       session.deleteRows(table.name(), values);
+      invalidateCount(table.name());
       showTable(table);
       setStatus("已刪除 " + values.size() + " 列", false);
     } catch (SqlException | IllegalStateException ex) {
@@ -1347,9 +1536,12 @@ public final class DbAdmin {
     }
     DefaultMutableTreeNode root = new DefaultMutableTreeNode(session.path().toString());
     for (TableInfo table : visibleTables()) {
-      DefaultMutableTreeNode tableNode = new DefaultMutableTreeNode(new TableNode(table));
+      DefaultMutableTreeNode tableNode =
+          new DefaultMutableTreeNode(new TableNode(table, countCache.get(table.name())));
+      Map<String, Integer> groups = ratioGroupCache.getOrDefault(table.name(), Map.of());
       for (Column column : table.columns()) {
-        tableNode.add(new DefaultMutableTreeNode(new ColumnNode(column)));
+        tableNode.add(
+            new DefaultMutableTreeNode(new ColumnNode(column, groups.get(column.name()))));
       }
       root.add(tableNode);
     }
@@ -1582,17 +1774,23 @@ public final class DbAdmin {
     return new Font(Font.MONOSPACED, Font.PLAIN, 13);
   }
 
-  private record TableNode(TableInfo table) {
+  private record TableNode(TableInfo table, Integer knownCount) {
     @Override
     public String toString() {
-      return table.name() + " (" + table.rowCount() + ")";
+      if (knownCount == null) {
+        return table.name();
+      }
+      return table.name() + " (" + knownCount + ")";
     }
   }
 
-  private record ColumnNode(Column column) {
+  private record ColumnNode(Column column, Integer groupCount) {
     @Override
     public String toString() {
-      return column.name() + "  " + column.type();
+      if (groupCount == null) {
+        return column.name() + "  " + column.type();
+      }
+      return column.name() + "  " + column.type() + " (" + groupCount + ")";
     }
   }
 

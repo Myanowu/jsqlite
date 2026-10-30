@@ -24,8 +24,8 @@ public final class FileBackedRows {
   /** INTEGER PRIMARY KEY column that aliases the btree rowid (−1 if none). */
   private final int integerPkIndex;
   private long[] cellOffsets;
-  private Object[] cachedRow;
-  private int cachedIndex = -1;
+  /** Per-thread decode cache — shared read locks allow concurrent row access. */
+  private final ThreadLocal<Cache> cache = ThreadLocal.withInitial(Cache::new);
 
   public FileBackedRows(
       DbImage file, int pageSize, int reserved, int rootPage, List<Column> columns, String tableName) {
@@ -72,21 +72,27 @@ public final class FileBackedRows {
     if (row < 0 || row >= cellOffsets.length) {
       throw new SqlException("row " + row + " out of range for " + tableName);
     }
-    if (cachedIndex == row && cachedRow != null) {
-      return cachedRow;
+    Cache local = cache.get();
+    if (local.index == row && local.row != null) {
+      return local.row;
     }
-    cachedRow = decode(cellOffsets[row]);
-    cachedIndex = row;
-    return cachedRow;
+    local.row = decode(cellOffsets[row]);
+    local.index = row;
+    return local.row;
   }
 
   private void ensureIndex() {
     if (cellOffsets != null) {
       return;
     }
-    LongList offsets = new LongList();
-    walk(rootPage, rootPage == 1, offsets);
-    cellOffsets = offsets.toArray();
+    synchronized (this) {
+      if (cellOffsets != null) {
+        return;
+      }
+      LongList offsets = new LongList();
+      walk(rootPage, rootPage == 1, offsets);
+      cellOffsets = offsets.toArray();
+    }
   }
 
   private void walk(int pageNumber, boolean page1, LongList offsets) {
@@ -225,6 +231,11 @@ public final class FileBackedRows {
       }
     }
     return (value << 8) | (file.get(cursor[0]++) & 0xff);
+  }
+
+  private static final class Cache {
+    private Object[] row;
+    private int index = -1;
   }
 
   private static final class LongList {

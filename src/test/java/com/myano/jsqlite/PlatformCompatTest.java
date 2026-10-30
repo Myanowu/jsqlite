@@ -10,6 +10,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Timestamp;
 import java.util.ArrayList;
@@ -22,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PlatformCompatTest {
@@ -67,6 +69,67 @@ class PlatformCompatTest {
       } finally {
         pool.shutdownNow();
       }
+    }
+  }
+
+  /** 验收：写挡读 — 短 busy_timeout 下读方得到 database is locked。 */
+  @Test
+  void readerTimesOutWhileWriterHoldsUncommittedWrite() throws Exception {
+    Path file = Files.createTempDirectory("jsqlite-busy-read").resolve("mdtdb.db");
+    String url = "jdbc:jsqlite:" + file + "?busy_timeout=80";
+    try (Connection writer = DriverManager.getConnection(url);
+        Connection reader = DriverManager.getConnection(url)) {
+      writer.createStatement().executeUpdate("CREATE TABLE t (id INTEGER)");
+      writer.setAutoCommit(false);
+      writer.createStatement().executeUpdate("INSERT INTO t VALUES (1)");
+      long start = System.nanoTime();
+      SQLException locked =
+          assertThrows(
+              SQLException.class,
+              () -> {
+                try (ResultSet ignored = reader.createStatement().executeQuery("SELECT COUNT(*) FROM t")) {
+                  // should not reach
+                }
+              });
+      assertTrue(locked.getMessage().contains("database is locked"), locked.getMessage());
+      assertTrue(System.nanoTime() - start < TimeUnit.SECONDS.toNanos(3));
+      writer.rollback();
+    }
+  }
+
+  /** 验收：池化多读 — 多线程并行 SELECT 不因互锁失败。 */
+  @Test
+  void parallelReadersCompleteWithoutSerializingErrors() throws Exception {
+    Path file = Files.createTempDirectory("jsqlite-parallel-read").resolve("mdtdb.db");
+    String url = "jdbc:jsqlite:" + file + "?busy_timeout=5000";
+    try (Connection setup = DriverManager.getConnection(url)) {
+      setup.createStatement().executeUpdate("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+      setup.setAutoCommit(false);
+      for (int i = 0; i < 2_000; i++) {
+        setup.createStatement().executeUpdate("INSERT INTO t VALUES (" + i + ", 'n" + i + "')");
+      }
+      setup.commit();
+    }
+    ExecutorService pool = Executors.newFixedThreadPool(8);
+    try {
+      List<Future<Long>> futures = new ArrayList<>();
+      for (int t = 0; t < 8; t++) {
+        futures.add(
+            pool.submit(
+                () -> {
+                  try (Connection connection = DriverManager.getConnection(url);
+                      ResultSet result =
+                          connection.createStatement().executeQuery("SELECT COUNT(*) FROM t")) {
+                    assertTrue(result.next());
+                    return result.getLong(1);
+                  }
+                }));
+      }
+      for (Future<Long> future : futures) {
+        assertEquals(2_000L, future.get(30, TimeUnit.SECONDS));
+      }
+    } finally {
+      pool.shutdownNow();
     }
   }
 

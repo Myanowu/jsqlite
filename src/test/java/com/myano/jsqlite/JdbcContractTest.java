@@ -51,6 +51,7 @@ class JdbcContractTest {
   void driverCreatesASqliteFile() throws Exception {
     Path dir = Files.createTempDirectory("jsqlite-r2");
     Path file = dir.resolve("new.sqlite");
+    // Recommended pool URL shape — see .cursor/plans/jsqlite-concurrency.md
     String url = "jdbc:jsqlite:" + file + "?journal_mode=WAL&busy_timeout=8000";
     try (Connection connection = DriverManager.getConnection(url)) {
       assertEquals("", connection.getCatalog());

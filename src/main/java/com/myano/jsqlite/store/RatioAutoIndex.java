@@ -8,16 +8,18 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.LinkedHashSet;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
 
 /**
  * For large tables, discover low-cardinality columns (compression ratio = rows/distinct) and install
  * in-memory posting indexes so {@code SeekIdx} can probe single-column equalities.
  *
  * <p>Meta file {@code {metaDir}/{table}.ratio-cols} remembers winning column names across opens so
- * the next process only rebuilds postings for those columns (one scan), not every column.
+ * the next process only rebuilds postings for those columns (one scan), not every column. Optional
+ * {@code name=distinct} lines cache group counts for admin / tooling.
  *
  * <p>Writes: {@link Table} materialize + {@code indexRow} keep postings up to date after mutation.
  */
@@ -102,6 +104,42 @@ public final class RatioAutoIndex {
     return table.rowCount() >= minRows;
   }
 
+  /**
+   * Distinct-value counts for ratio-index winner columns (high compression). Empty when the table
+   * has no winners. Prefers meta {@code name=distinct}, then live postings, else one scan of winners
+   * only (and rewrites meta when possible).
+   */
+  public static Map<String, Integer> groupCounts(Table table) {
+    if (table == null) {
+      return Map.of();
+    }
+    synchronized (table) {
+      ensure(table);
+      List<String> winners = table.ratioWinnerNames();
+      if (winners.isEmpty()) {
+        return Map.of();
+      }
+      Path metaDir = table.ratioMetaDir();
+      Path meta = metaDir == null ? null : metaFile(metaDir, table.name());
+      Map<String, Integer> cached = readMetaCounts(meta);
+      if (completeCounts(winners, cached)) {
+        return cached;
+      }
+      Map<String, Integer> fromIndex = postingCounts(table, winners);
+      if (completeCounts(winners, fromIndex)) {
+        if (meta != null) {
+          writeMeta(meta, fromIndex, table.rowCount(), minRatio);
+        }
+        return fromIndex;
+      }
+      Map<String, Integer> scanned = scanWinnerDistinct(table, winners);
+      if (meta != null && !scanned.isEmpty()) {
+        writeMeta(meta, scanned, table.rowCount(), minRatio);
+      }
+      return scanned;
+    }
+  }
+
   private static void analyzeAndInstall(Table table, int n) {
     int cols = table.columns().size();
     if (cols == 0) {
@@ -143,7 +181,7 @@ public final class RatioAutoIndex {
       }
     }
     List<Integer> winnerCols = new ArrayList<>();
-    List<String> winners = new ArrayList<>();
+    Map<String, Integer> winnerCounts = new LinkedHashMap<>();
     for (int c = 0; c < cols; c++) {
       if (dead[c] || distincts[c] == null || distincts[c].isEmpty()) {
         continue;
@@ -153,7 +191,7 @@ public final class RatioAutoIndex {
         continue;
       }
       winnerCols.add(c);
-      winners.add(table.columns().get(c).name());
+      winnerCounts.put(table.columns().get(c).name(), (int) distinct);
     }
     distincts = null; // free pass-1 sets before optional posting build
 
@@ -180,26 +218,101 @@ public final class RatioAutoIndex {
       }
     }
 
-    table.setRatioWinners(winners);
+    table.setRatioWinners(winnerCounts.keySet());
     Path metaDir = table.ratioMetaDir();
     if (metaDir != null) {
-      writeMeta(metaFile(metaDir, table.name()), winners, n, minRatio);
+      writeMeta(metaFile(metaDir, table.name()), winnerCounts, n, minRatio);
     }
     table.markRatioAnalyzed();
   }
 
+  private static boolean completeCounts(List<String> winners, Map<String, Integer> counts) {
+    if (counts == null || counts.isEmpty()) {
+      return false;
+    }
+    for (String name : winners) {
+      if (counts.get(name) == null) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static Map<String, Integer> postingCounts(Table table, List<String> winners) {
+    Map<String, Integer> out = new LinkedHashMap<>();
+    for (String name : winners) {
+      int distinct = table.ratioPostingDistinct(name);
+      if (distinct < 0) {
+        return Map.of();
+      }
+      out.put(name, distinct);
+    }
+    return out;
+  }
+
+  private static Map<String, Integer> scanWinnerDistinct(Table table, List<String> winners) {
+    Map<String, Integer> indexes = new LinkedHashMap<>();
+    for (String name : winners) {
+      int index = table.columnIndex(name);
+      if (index >= 0) {
+        indexes.put(name, index);
+      }
+    }
+    if (indexes.isEmpty()) {
+      return Map.of();
+    }
+    Map<String, HashSet<Object>> distincts = new LinkedHashMap<>();
+    for (String name : indexes.keySet()) {
+      distincts.put(name, new HashSet<>());
+    }
+    int n = table.rowCount();
+    for (int i = 0; i < n; i++) {
+      Object[] row = table.peekRow(i);
+      for (Map.Entry<String, Integer> entry : indexes.entrySet()) {
+        Object value = row[entry.getValue()];
+        if (value != null) {
+          distincts.get(entry.getKey()).add(value);
+        }
+      }
+    }
+    Map<String, Integer> out = new LinkedHashMap<>();
+    for (Map.Entry<String, HashSet<Object>> entry : distincts.entrySet()) {
+      out.put(entry.getKey(), entry.getValue().size());
+    }
+    return out;
+  }
+
   private static List<String> readMeta(Path file) {
+    Map<String, Integer> counts = readMetaCounts(file);
+    return counts == null ? null : List.copyOf(counts.keySet());
+  }
+
+  /** {@code null} if missing; values may be absent for legacy name-only lines. */
+  private static Map<String, Integer> readMetaCounts(Path file) {
     if (file == null || !Files.isRegularFile(file)) {
       return null;
     }
     try {
-      List<String> names = new ArrayList<>();
+      Map<String, Integer> names = new LinkedHashMap<>();
       for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
-        String name = line.trim();
-        if (name.isEmpty() || name.startsWith("#")) {
+        String text = line.trim();
+        if (text.isEmpty() || text.startsWith("#")) {
           continue;
         }
-        names.add(name);
+        int split = text.lastIndexOf('=');
+        if (split > 0) {
+          String name = text.substring(0, split).trim();
+          String number = text.substring(split + 1).trim();
+          if (!name.isEmpty()) {
+            try {
+              names.put(name, Integer.parseInt(number));
+              continue;
+            } catch (NumberFormatException ignored) {
+              // Fall through and treat the whole line as a column name.
+            }
+          }
+        }
+        names.put(text, null);
       }
       return names;
     } catch (IOException ex) {
@@ -207,7 +320,7 @@ public final class RatioAutoIndex {
     }
   }
 
-  private static void writeMeta(Path file, List<String> columns, int rows, int ratio) {
+  private static void writeMeta(Path file, Map<String, Integer> columns, int rows, int ratio) {
     try {
       Files.createDirectories(file.getParent());
       StringBuilder body = new StringBuilder();
@@ -216,9 +329,17 @@ public final class RatioAutoIndex {
           .append(" minRatio=")
           .append(ratio)
           .append('\n');
-      Set<String> unique = new LinkedHashSet<>(columns);
-      for (String name : unique) {
-        body.append(name).append('\n');
+      for (Map.Entry<String, Integer> entry : new LinkedHashMap<>(columns).entrySet()) {
+        String name = entry.getKey();
+        if (name == null || name.isEmpty()) {
+          continue;
+        }
+        Integer distinct = entry.getValue();
+        if (distinct == null) {
+          body.append(name).append('\n');
+        } else {
+          body.append(name).append('=').append(distinct.intValue()).append('\n');
+        }
       }
       Files.writeString(file, body.toString(), StandardCharsets.UTF_8);
     } catch (IOException ex) {

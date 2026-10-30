@@ -97,7 +97,13 @@ public final class Parser {
       String name = expect(TokenType.IDENT).text();
       String argument = null;
       if (match(TokenType.LPAREN)) {
-        argument = expect(TokenType.IDENT).text();
+        Token arg = peek();
+        if (arg.type() == TokenType.IDENT || arg.type() == TokenType.NUMBER) {
+          argument = arg.text();
+          pos++;
+        } else {
+          throw syntax("expected a pragma argument");
+        }
         expect(TokenType.RPAREN);
       }
       String value = null;

@@ -62,6 +62,12 @@ class FileBackedQueryTest {
     assertTrue(
         java.util.Arrays.equals(before, Files.readAllBytes(file)),
         "read-only queries must leave the file untouched");
+    try (Database db = Database.open(file)) {
+      // Catalog listing keeps deferred/file-backed tables at 0 so open does not index every btree.
+      assertEquals(0, db.tables().stream().filter(t -> t.name().equals("bal")).findFirst().orElseThrow().rowCount());
+      assertEquals(500, db.rowCount("bal"));
+      assertEquals(2, db.rowCount("acct"));
+    }
     Files.deleteIfExists(file);
   }
 }

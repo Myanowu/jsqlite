@@ -118,6 +118,27 @@ public final class Table {
     return ratioWinners.contains(columns.get(column).name());
   }
 
+  /** Ratio-index winner column names in discovery order (may lack postings until first seek). */
+  public java.util.List<String> ratioWinnerNames() {
+    return java.util.List.copyOf(ratioWinners);
+  }
+
+  /**
+   * Distinct keys in an installed ratio posting for {@code columnName}, or {@code -1} if that
+   * posting is not populated yet.
+   */
+  public int ratioPostingDistinct(String columnName) {
+    int column = columnIndex(columnName);
+    if (column < 0) {
+      return -1;
+    }
+    IndexMap map = findIndexMap(new int[] {column});
+    if (map == null || !map.populated) {
+      return -1;
+    }
+    return map.unique ? map.uniqueRows.size() : map.multiRows.size();
+  }
+
   /**
    * Shared row view for indexing passes — valid until the next row access when file-backed. Callers
    * must not retain or mutate the array.
@@ -942,47 +963,65 @@ public final class Table {
     if (map.populated) {
       return;
     }
+    // Build off-lock so concurrent readers / ratio-analyze do not deadlock with Engine RW locks.
+    Map<Object, Integer> unique = map.unique ? new HashMap<>() : null;
+    Map<Object, ArrayList<Integer>> multi = map.unique ? null : new HashMap<>();
     if (fileRows != null && !mutated && rows.isEmpty()) {
       int n = fileRows.rowCount();
       for (int i = 0; i < n; i++) {
-        indexOne(map, fileRows.peekRow(i), i);
+        indexOneInto(map, fileRows.peekRow(i), i, unique, multi);
+      }
+    } else {
+      ensureLoaded();
+      for (int i = 0; i < rows.size(); i++) {
+        indexOneInto(map, rows.get(i), i, unique, multi);
+      }
+    }
+    synchronized (this) {
+      if (map.populated) {
+        return;
+      }
+      if (map.unique) {
+        map.uniqueRows.clear();
+        map.uniqueRows.putAll(unique);
+      } else {
+        map.multiRows.clear();
+        map.multiRows.putAll(multi);
       }
       map.populated = true;
-      return;
     }
-    ensureLoaded();
-    map.uniqueRows.clear();
-    map.multiRows.clear();
-    for (int i = 0; i < rows.size(); i++) {
-      indexOne(map, rows.get(i), i);
-    }
-    map.populated = true;
   }
 
   private void ensurePrimaryIndex() {
     if (primaryIndexBuilt || primaryKey.length == 0) {
       return;
     }
+    Map<Object, Integer> built = new HashMap<>();
     if (fileRows != null && !mutated && rows.isEmpty()) {
       int n = fileRows.rowCount();
       for (int i = 0; i < n; i++) {
         Object mapKey = keyOfRow(fileRows.peekRow(i), primaryKey);
         if (mapKey != null) {
-          primaryIndex.put(mapKey, i);
+          built.put(mapKey, i);
         }
       }
-      primaryIndexBuilt = true;
-      return;
-    }
-    ensureLoaded();
-    primaryIndex.clear();
-    for (int i = 0; i < rows.size(); i++) {
-      Object mapKey = keyOfRow(rows.get(i), primaryKey);
-      if (mapKey != null) {
-        primaryIndex.put(mapKey, i);
+    } else {
+      ensureLoaded();
+      for (int i = 0; i < rows.size(); i++) {
+        Object mapKey = keyOfRow(rows.get(i), primaryKey);
+        if (mapKey != null) {
+          built.put(mapKey, i);
+        }
       }
     }
-    primaryIndexBuilt = true;
+    synchronized (this) {
+      if (primaryIndexBuilt) {
+        return;
+      }
+      primaryIndex.clear();
+      primaryIndex.putAll(built);
+      primaryIndexBuilt = true;
+    }
   }
 
   private void indexRow(Object[] row, int index) {
@@ -1037,6 +1076,26 @@ public final class Table {
       map.uniqueRows.put(key, index);
     } else {
       map.multiRows.computeIfAbsent(key, ignored -> new ArrayList<>()).add(index);
+    }
+  }
+
+  private void indexOneInto(
+      IndexMap map,
+      Object[] row,
+      int index,
+      Map<Object, Integer> unique,
+      Map<Object, ArrayList<Integer>> multi) {
+    if (skips(map, row)) {
+      return;
+    }
+    Object key = keyOfRow(row, map.columns);
+    if (key == null) {
+      return;
+    }
+    if (map.unique) {
+      unique.put(key, index);
+    } else {
+      multi.computeIfAbsent(key, ignored -> new ArrayList<>()).add(index);
     }
   }
 

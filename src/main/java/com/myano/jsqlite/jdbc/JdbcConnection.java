@@ -21,6 +21,10 @@ public final class JdbcConnection {
   private final String url;
   private boolean closed;
   private boolean readOnly;
+  /**
+   * Reported as {@link Connection#TRANSACTION_SERIALIZABLE}: writes are exclusive, reads are shared.
+   * This is not SQLite-style snapshot / MVCC isolation — see {@code .cursor/plans/jsqlite-concurrency.md}.
+   */
   private int transactionIsolation = Connection.TRANSACTION_SERIALIZABLE;
   private int networkTimeoutMs;
   private String catalog = "";
@@ -229,6 +233,14 @@ public final class JdbcConnection {
   private Object setTransactionIsolation(Method method, Object[] args) throws SQLException {
     if (args.length != 1 || !(args[0] instanceof Integer level)) {
       throw JdbcProxy.unsupported(method);
+    }
+    // Accepted for Hibernate compatibility; engine always uses write-serial / read-shared locking.
+    if (level != Connection.TRANSACTION_NONE
+        && level != Connection.TRANSACTION_READ_UNCOMMITTED
+        && level != Connection.TRANSACTION_READ_COMMITTED
+        && level != Connection.TRANSACTION_REPEATABLE_READ
+        && level != Connection.TRANSACTION_SERIALIZABLE) {
+      throw new SQLException("unsupported transaction isolation " + level);
     }
     transactionIsolation = level;
     return null;

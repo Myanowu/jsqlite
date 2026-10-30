@@ -24,6 +24,21 @@ public final class MemoryCatalog {
   private int changes;
   private Long generatedKey;
 
+  /**
+   * Drop all tables/indexes for a WAL remount. Must not run inside a user transaction.
+   */
+  public void resetForReload() {
+    if (inTransaction) {
+      throw new SqlException("cannot reload catalog during a transaction");
+    }
+    tables.clear();
+    indexes.clear();
+    statementSnapshot = null;
+    transactionSnapshot = null;
+    changes = 0;
+    generatedKey = null;
+  }
+
   public void createTable(String name, List<Column> columns, String sql) {
     createTable(name, columns, List.of(), false, sql);
   }

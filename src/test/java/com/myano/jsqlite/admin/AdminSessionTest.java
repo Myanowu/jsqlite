@@ -154,6 +154,46 @@ class AdminSessionTest {
   }
 
   @Test
+  void settingsPragmasCanBeReadAndApplied() {
+    try (AdminSession session = new AdminSession()) {
+      session.create(Path.of("settings-db"));
+      assertTrue(
+          "memory".equals(session.journalMode()) || "delete".equals(session.journalMode()),
+          session.journalMode());
+      session.applySettings("delete", 2_500L, true, false, 50_000L, 80);
+      assertEquals("delete", session.journalMode());
+      assertEquals(2_500L, session.busyTimeout());
+      assertTrue(session.foreignKeys());
+      assertTrue(!session.bulkLoad());
+      assertEquals(50_000L, session.ratioMinRows());
+      assertEquals(80, session.ratioMinRatio());
+      ScriptResult mode = session.run("PRAGMA busy_timeout");
+      assertEquals(ScriptResult.Kind.QUERY, mode.kind());
+      assertEquals(2_500L, mode.rows().get(0).values().get(0));
+    }
+  }
+
+  @Test
+  void rowCountReadsFileBackedTablesThatListAsZero() throws Exception {
+    Path file = Files.createTempFile("jsqlite-admin-count", ".sqlite");
+    Files.deleteIfExists(file);
+    try (java.sql.Connection connection = java.sql.DriverManager.getConnection("jdbc:jsqlite:" + file);
+        java.sql.Statement statement = connection.createStatement()) {
+      statement.executeUpdate("CREATE TABLE note (id INTEGER, body TEXT)");
+      statement.executeUpdate("INSERT INTO note VALUES (1, 'a')");
+      statement.executeUpdate("INSERT INTO note VALUES (2, 'b')");
+    }
+    try (AdminSession session = new AdminSession()) {
+      session.open(file);
+      assertEquals(0, session.tables().get(0).rowCount());
+      assertEquals(2, session.rowCount("note"));
+      assertEquals(2, session.run("SELECT * FROM note").rows().size());
+    } finally {
+      Files.deleteIfExists(file);
+    }
+  }
+
+  @Test
   void sqliteFileOpensReadOnlyAndStaysUntouched() throws Exception {
     Path file = Files.createTempFile("jsqlite-open", ".sqlite");
     byte[] header = "SQLite format 3\0".getBytes(StandardCharsets.US_ASCII);

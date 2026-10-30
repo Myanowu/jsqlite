@@ -16,10 +16,10 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
 
-/** 同一個檔案在行程內共用一份目錄。交易期間用 gate 互斥，避免連線池各自看到過期資料。 */
+/**
+ * 同一個檔案在行程內共用一份目錄。讀共享、寫獨占；寫鎖對「另一個 {@link Database}」不可重入（同執行緒第二連線會 busy），避免共目錄誤寫。
+ */
 final class Engine {
   private static final ConcurrentHashMap<String, Engine> OPEN = new ConcurrentHashMap<>();
   /** One worker: large-table ratio analyze must not stampede the heap on open. */
@@ -33,7 +33,10 @@ final class Engine {
 
   final Path path;
   final MemoryCatalog catalog = new MemoryCatalog();
-  final Semaphore gate = new Semaphore(1);
+  private final Object lock = new Object();
+  private int readers;
+  private boolean writer;
+  private Thread writeOwner;
   Pager pager;
   String journalMode = "memory";
   boolean foreignKeys;
@@ -43,6 +46,10 @@ final class Engine {
   SqliteReader.Pin dataPin;
   /** Sidecar file images mounted into {@link #catalog}. */
   final List<DbImage> sidecarImages = new ArrayList<>();
+  /** Last applied {@code -wal} / main-file fingerprint for cross-process refresh. */
+  private long walSeenBytes;
+  private long mainSeenBytes;
+  private long mainSeenMtime;
   private final boolean shared;
   private int refs;
 
@@ -133,21 +140,159 @@ final class Engine {
     bindRatioMeta();
   }
 
-  boolean tryEnter(long busyTimeoutMs) {
+  boolean tryEnterRead(long busyTimeoutMs) {
+    long deadline = busyTimeoutMs <= 0 ? 0 : System.currentTimeMillis() + busyTimeoutMs;
+    synchronized (lock) {
+      while (writer) {
+        if (!waitForLock(deadline, busyTimeoutMs)) {
+          return false;
+        }
+      }
+      readers++;
+      return true;
+    }
+  }
+
+  boolean tryEnterWrite(long busyTimeoutMs) {
+    long deadline = busyTimeoutMs <= 0 ? 0 : System.currentTimeMillis() + busyTimeoutMs;
+    synchronized (lock) {
+      // Another Database on this thread already holds the write lock — not reentrant across connections.
+      if (writer && writeOwner == Thread.currentThread()) {
+        return false;
+      }
+      while (writer || readers > 0) {
+        if (!waitForLock(deadline, busyTimeoutMs)) {
+          return false;
+        }
+      }
+      writer = true;
+      writeOwner = Thread.currentThread();
+      return true;
+    }
+  }
+
+  void exitRead() {
+    synchronized (lock) {
+      if (readers <= 0) {
+        throw new IllegalStateException("read lock not held");
+      }
+      readers--;
+      if (readers == 0) {
+        lock.notifyAll();
+      }
+    }
+  }
+
+  void exitWrite() {
+    synchronized (lock) {
+      if (!writer || writeOwner != Thread.currentThread()) {
+        throw new IllegalStateException("write lock not held");
+      }
+      writer = false;
+      writeOwner = null;
+      lock.notifyAll();
+    }
+  }
+
+  /** Drop write ownership and become a reader (WAL refresh downgrade). Write lock must be held. */
+  void downgradeWriteToRead() {
+    synchronized (lock) {
+      if (!writer || writeOwner != Thread.currentThread()) {
+        throw new IllegalStateException("write lock not held");
+      }
+      writer = false;
+      writeOwner = null;
+      readers++;
+      lock.notifyAll();
+    }
+  }
+
+  private boolean waitForLock(long deadline, long busyTimeoutMs) {
     try {
       if (busyTimeoutMs <= 0) {
-        gate.acquire();
+        lock.wait();
         return true;
       }
-      return gate.tryAcquire(busyTimeoutMs, TimeUnit.MILLISECONDS);
+      long remaining = deadline - System.currentTimeMillis();
+      if (remaining <= 0) {
+        return false;
+      }
+      lock.wait(remaining);
+      return true;
     } catch (InterruptedException ex) {
       Thread.currentThread().interrupt();
       return false;
     }
   }
 
-  void exit() {
-    gate.release();
+  boolean walPossiblyStale() {
+    if (!"wal".equals(journalMode) || path == null || !Files.isRegularFile(path)) {
+      return false;
+    }
+    try {
+      long mainSize = Files.size(path);
+      long mainMtime = Files.getLastModifiedTime(path).toMillis();
+      if (mainSize != mainSeenBytes || mainMtime != mainSeenMtime) {
+        return true;
+      }
+      Path wal = WalReader.pathFor(path);
+      if (!Files.isRegularFile(wal)) {
+        return walSeenBytes > 0;
+      }
+      return Files.size(wal) != walSeenBytes;
+    } catch (java.io.IOException ex) {
+      return false;
+    }
+  }
+
+  /** Caller must hold the write lock. Reloads catalog from main + WAL when the on-disk image moved. */
+  void refreshFromWalIfNeeded() {
+    if (!walPossiblyStale()) {
+      return;
+    }
+    releaseSidecars();
+    releaseDataPin();
+    catalog.resetForReload();
+    Pager opened = Pager.open(path);
+    byte[][] pages = WalReader.apply(path, opened.stealPages());
+    byte[] flat = Pager.flatten(pages);
+    dataPin = SqliteReader.loadBytes(flat, catalog);
+    mountSidecars();
+    bindRatioMeta();
+    pager = Pager.detached(path);
+    captureDiskFingerprint();
+  }
+
+  void noteWalLength(long bytes) {
+    walSeenBytes = bytes;
+    captureMainFingerprint();
+  }
+
+  /** After a durable persist (delete or WAL), refresh the on-disk fingerprint. */
+  void notePersistedImage() {
+    captureDiskFingerprint();
+  }
+
+  private void captureDiskFingerprint() {
+    captureMainFingerprint();
+    Path wal = WalReader.pathFor(path);
+    try {
+      walSeenBytes = Files.isRegularFile(wal) ? Files.size(wal) : 0L;
+    } catch (java.io.IOException ex) {
+      walSeenBytes = 0L;
+    }
+  }
+
+  private void captureMainFingerprint() {
+    if (path == null || !Files.isRegularFile(path)) {
+      return;
+    }
+    try {
+      mainSeenBytes = Files.size(path);
+      mainSeenMtime = Files.getLastModifiedTime(path).toMillis();
+    } catch (java.io.IOException ignored) {
+      // leave previous fingerprint
+    }
   }
 
   private static Engine load(Path path) {
@@ -163,6 +308,7 @@ final class Engine {
       engine.mountSidecars();
       engine.bindRatioMeta();
       engine.pager = Pager.detached(path);
+      engine.captureDiskFingerprint();
       return engine;
     }
     // WAL: merge frames, then defer row loads from the flattened image (no lasting page copy).
@@ -174,6 +320,7 @@ final class Engine {
     engine.mountSidecars();
     engine.bindRatioMeta();
     engine.pager = Pager.detached(path);
+    engine.captureDiskFingerprint();
     return engine;
   }
 

@@ -214,6 +214,7 @@ final class JdbcDatabaseMetaData {
       return switch (method.getName()) {
         case "getDatabaseMajorVersion" -> 3;
         case "getDriverMinorVersion" -> 1;
+        // Write-serial / read-shared — not snapshot isolation (jsqlite-concurrency.md).
         case "getDefaultTransactionIsolation" -> java.sql.Connection.TRANSACTION_SERIALIZABLE;
         default -> 0;
       };
